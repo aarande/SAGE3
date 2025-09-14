@@ -35,6 +35,7 @@ import {
   MdStop,
   MdRadioButtonChecked,
   MdSync,
+  MdSecurity,
 } from 'react-icons/md';
 
 import { useAppStore, useUser, processContentURL, useHexColor, useUIStore, useWindowResize } from '@sage3/frontend';
@@ -42,6 +43,8 @@ import { App } from '../../schema';
 import { state as AppState } from './index';
 import { AppWindow, ElectronRequired } from '../../components';
 import { SyncWebviewEvent, SyncWebviewWebSocketMessage } from './types';
+import { EventRecorderService } from './services/EventRecorderService';
+import { WorkerManagerService } from './services/WorkerManagerService';
 
 // Electron webview type
 // @ts-ignore
@@ -70,6 +73,11 @@ function AppComponent(props: App): JSX.Element {
   const [isReplaying, setIsReplaying] = useState<boolean>(s.isReplaying);
   const [zoom, setZoom] = useState<number>(s.zoom);
 
+  // rrweb Services
+  const recorderServiceRef = useRef<EventRecorderService | null>(null);
+  const workerManagerRef = useRef<WorkerManagerService | null>(null);
+  const [recordingError, setRecordingError] = useState<string | null>(null);
+
   // UI
   const boardDragging = useUIStore((state) => state.boardDragging);
 
@@ -91,6 +99,96 @@ function AppComponent(props: App): JSX.Element {
     setIsReplaying(s.isReplaying);
     setZoom(s.zoom);
   }, [s.url, s.isRecording, s.isReplaying, s.zoom]);
+
+  // Initialize rrweb services
+  useEffect(() => {
+    if (!isElectron()) return; // Only initialize in Electron
+
+    const initializeServices = async () => {
+      try {
+        // Initialize Worker Manager
+        const workerManager = new WorkerManagerService(
+          handleRecordedEvent,
+          handleEventBatch,
+          handleWorkerError
+        );
+        await workerManager.initialize();
+        workerManagerRef.current = workerManager;
+
+        // Initialize Event Recorder
+        const recorder = new EventRecorderService(
+          handleRecordedEvent,
+          user?.data.name || 'anonymous',
+          props._id // Use app ID as session ID
+        );
+        recorderServiceRef.current = recorder;
+
+        console.log('SyncWebview: rrweb services initialized');
+      } catch (error) {
+        console.error('SyncWebview: Failed to initialize rrweb services:', error);
+        setRecordingError('Failed to initialize recording services');
+        toast({
+          title: 'Recording Error',
+          description: 'Failed to initialize recording services',
+          status: 'error',
+          duration: 5000,
+        });
+      }
+    };
+
+    initializeServices();
+
+    // Cleanup on unmount
+    return () => {
+      if (recorderServiceRef.current) {
+        recorderServiceRef.current.stopRecording();
+      }
+      if (workerManagerRef.current) {
+        workerManagerRef.current.terminate();
+      }
+    };
+  }, [props._id, user?.data.name, toast]);
+
+  // Auto-start recording when webview is ready
+  useEffect(() => {
+    if (!recorderServiceRef.current || !isElectron() || !domReady || !attached || !webviewRef.current) return;
+
+    // Start recording automatically when webview is ready
+    if (!recorderServiceRef.current.getIsRecording()) {
+      try {
+        // Add a small delay to ensure webview is fully loaded
+        setTimeout(() => {
+          if (recorderServiceRef.current && !recorderServiceRef.current.getIsRecording()) {
+            recorderServiceRef.current.startRecording({
+              maskInputOptions: {
+                password: s.privacy.maskPasswords,
+              },
+            });
+            setRecordingError(null);
+            // Update state to reflect that recording has started
+            updateState(props._id, { isRecording: true });
+            console.log('SyncWebview: Auto-started recording with stable rrweb version');
+          }
+        }, 1000); // 1 second delay
+      } catch (error) {
+        console.error('SyncWebview: Failed to auto-start recording:', error);
+        setRecordingError('Failed to start recording');
+        updateState(props._id, { isRecording: false });
+      }
+    }
+  }, [domReady, attached, s.privacy.maskPasswords, props._id, updateState]);
+
+
+
+  // Handle privacy settings changes
+  useEffect(() => {
+    if (recorderServiceRef.current) {
+      recorderServiceRef.current.updatePrivacySettings(
+        s.privacy.maskPasswords,
+        s.privacy.maskElements
+      );
+    }
+  }, [s.privacy.maskPasswords, s.privacy.maskElements]);
 
   // Init the webview (Electron only)
   const setWebviewRef = useCallback((node: WebviewTag) => {
@@ -176,6 +274,59 @@ function AppComponent(props: App): JSX.Element {
     }
   }, [s.zoom, domReady, attached]);
 
+  // Event handling functions for rrweb
+  const handleRecordedEvent = useCallback((event: SyncWebviewEvent) => {
+    // Process event through worker if available
+    if (workerManagerRef.current && workerManagerRef.current.getIsInitialized()) {
+      workerManagerRef.current.processEvent(event);
+    } else {
+      // Fallback to direct processing
+      broadcastEvent(event);
+    }
+  }, []);
+
+  const handleEventBatch = useCallback((batch: any) => {
+    // Handle batched events from worker
+    console.log('SyncWebview: Received event batch from worker:', batch);
+    
+    // Broadcast regular events
+    if (batch.events && batch.events.length > 0) {
+      batch.events.forEach((event: SyncWebviewEvent) => {
+        broadcastEvent(event);
+      });
+    }
+
+    // Handle optimized mouse events
+    if (batch.mouseEvents) {
+      broadcastMouseBatch(batch.mouseEvents);
+    }
+  }, []);
+
+  const handleWorkerError = useCallback((error: any) => {
+    console.error('SyncWebview: Worker error:', error);
+    setRecordingError('Worker processing error');
+    toast({
+      title: 'Processing Error',
+      description: 'Event processing worker encountered an error',
+      status: 'warning',
+      duration: 3000,
+    });
+  }, [toast]);
+
+  const broadcastEvent = useCallback((event: SyncWebviewEvent) => {
+    // TODO: Integrate with SAGE3 WebSocket system
+    // For now, just log the event
+    console.log('SyncWebview: Broadcasting event:', event);
+    
+    // Update last event timestamp
+    updateState(props._id, { lastEventTimestamp: event.timestamp });
+  }, [props._id, updateState]);
+
+  const broadcastMouseBatch = useCallback((mouseBatch: any) => {
+    // TODO: Integrate with SAGE3 WebSocket system for mouse events
+    console.log('SyncWebview: Broadcasting mouse batch:', mouseBatch);
+  }, []);
+
   // Window resize hook
   const isFocused = useUIStore((state) => state.focusedAppId === props._id);
   const { width: winWidth, height: winHeight } = useWindowResize();
@@ -197,27 +348,33 @@ function AppComponent(props: App): JSX.Element {
             <HStack justify="space-between">
               <HStack>
                 <Text fontSize="sm" color="gray.600">
-                  Status:
+                  Sync:
                 </Text>
-                {isRecording && (
+                {recordingError && (
                   <HStack>
-                    <MdRadioButtonChecked color="red" />
-                    <Text fontSize="sm" color="red.500">Recording</Text>
+                    <Text fontSize="sm" color="red.500">Error: {recordingError}</Text>
                   </HStack>
                 )}
-                {isReplaying && (
+                {!recordingError && isRecording && (
                   <HStack>
-                    <MdPlayArrow color="green" />
-                    <Text fontSize="sm" color="green.500">Replaying</Text>
+                    <MdSync color="green" />
+                    <Text fontSize="sm" color="green.500">Active</Text>
                   </HStack>
                 )}
-                {!isRecording && !isReplaying && (
-                  <Text fontSize="sm" color="gray.500">Idle</Text>
+                {!recordingError && !isRecording && (
+                  <Text fontSize="sm" color="gray.500">Inactive</Text>
                 )}
               </HStack>
-              <Text fontSize="xs" color="gray.500">
-                Zoom: {Math.round(zoom * 100)}%
-              </Text>
+              <HStack spacing={4}>
+                {s.lastEventTimestamp > 0 && (
+                  <Text fontSize="xs" color="gray.500">
+                    Last Sync: {new Date(s.lastEventTimestamp).toLocaleTimeString()}
+                  </Text>
+                )}
+                <Text fontSize="xs" color="gray.500">
+                  Zoom: {Math.round(zoom * 100)}%
+                </Text>
+              </HStack>
             </HStack>
           </Box>
 
@@ -298,34 +455,21 @@ function ToolbarComponent(props: App): JSX.Element {
     }
   };
 
-  // Start/Stop recording
-  const toggleRecording = () => {
-    const newRecordingState = !s.isRecording;
-    updateState(props._id, { 
-      isRecording: newRecordingState,
-      isReplaying: false, // Stop replaying when starting recording
-    });
-    
-    toast({
-      title: newRecordingState ? 'Recording Started' : 'Recording Stopped',
-      description: newRecordingState ? 'Capturing interactions for synchronization' : 'Stopped capturing interactions',
-      status: newRecordingState ? 'success' : 'info',
-      duration: 2000,
-    });
-  };
 
-  // Start/Stop replaying
-  const toggleReplaying = () => {
-    const newReplayingState = !s.isReplaying;
-    updateState(props._id, { 
-      isReplaying: newReplayingState,
-      isRecording: false, // Stop recording when starting replay
+
+  // Toggle password masking
+  const togglePasswordMasking = () => {
+    updateState(props._id, {
+      privacy: {
+        ...s.privacy,
+        maskPasswords: !s.privacy.maskPasswords,
+      },
     });
     
     toast({
-      title: newReplayingState ? 'Replaying Started' : 'Replaying Stopped',
-      description: newReplayingState ? 'Synchronizing with other participants' : 'Stopped synchronization',
-      status: newReplayingState ? 'success' : 'info',
+      title: s.privacy.maskPasswords ? 'Password Masking Disabled' : 'Password Masking Enabled',
+      description: s.privacy.maskPasswords ? 'Password fields will be visible' : 'Password fields will be masked',
+      status: 'info',
       duration: 2000,
     });
   };
@@ -414,32 +558,29 @@ function ToolbarComponent(props: App): JSX.Element {
             </Button>
           </Tooltip>
 
-          {/* Sync Controls */}
-          <ButtonGroup isAttached size="xs" colorScheme="blue">
-            <Tooltip label={s.isRecording ? "Stop Recording" : "Start Recording"} placement="top" hasArrow openDelay={400}>
+
+
+
+
+          {/* Privacy Controls */}
+          {clientIsElectron && (
+            <Tooltip 
+              label={s.privacy.maskPasswords ? "Password masking enabled" : "Password masking disabled"} 
+              placement="top" 
+              hasArrow 
+              openDelay={400}
+            >
               <Button 
-                onClick={toggleRecording} 
+                onClick={togglePasswordMasking} 
                 size="xs" 
                 px={2}
-                variant={s.isRecording ? "solid" : "outline"}
-                colorScheme={s.isRecording ? "red" : "blue"}
+                variant={s.privacy.maskPasswords ? "solid" : "outline"}
+                colorScheme={s.privacy.maskPasswords ? "green" : "gray"}
               >
-                {s.isRecording ? <MdStop size="16px" /> : <MdRadioButtonChecked size="16px" />}
+                <MdSecurity size="16px" />
               </Button>
             </Tooltip>
-            
-            <Tooltip label={s.isReplaying ? "Stop Replaying" : "Start Replaying"} placement="top" hasArrow openDelay={400}>
-              <Button 
-                onClick={toggleReplaying} 
-                size="xs" 
-                px={2}
-                variant={s.isReplaying ? "solid" : "outline"}
-                colorScheme={s.isReplaying ? "green" : "blue"}
-              >
-                <MdPlayArrow size="16px" />
-              </Button>
-            </Tooltip>
-          </ButtonGroup>
+          )}
 
           {/* Zoom Controls */}
           <ButtonGroup isAttached size="xs" colorScheme="teal">

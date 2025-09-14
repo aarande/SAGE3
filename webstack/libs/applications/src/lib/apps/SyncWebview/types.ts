@@ -104,7 +104,7 @@ export interface ReplayerConfig {
 
 // Web Worker message types
 export interface WorkerMessage {
-  type: 'event' | 'batch' | 'snapshot' | 'config';
+  type: 'event' | 'batch' | 'snapshot' | 'config' | 'error';
   payload: any;
   timestamp: number;
 }

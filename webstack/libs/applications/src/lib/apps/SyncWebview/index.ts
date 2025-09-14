@@ -29,7 +29,7 @@ export type state = z.infer<typeof schema>;
 
 export const init: Partial<state> = {
   url: 'https://example.com/',
-  isRecording: false,
+  isRecording: true, // Auto-start recording with stable rrweb version
   isReplaying: false,
   lastEventTimestamp: 0,
   zoom: 1.0,
@@ -40,3 +40,7 @@ export const init: Partial<state> = {
 };
 
 export const name = 'SyncWebview';
+
+// Export services for external use
+export * from './services';
+export * from './types';
