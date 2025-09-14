@@ -175,6 +175,62 @@ export interface NavigationEvent {
   sessionId: string;
 }
 
+// Connection state for WebSocket management
+export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting' | 'error';
+
+// Message priority levels for queuing
+export type MessagePriority = 'critical' | 'high' | 'normal' | 'low';
+
+// Message acknowledgment interface
+export interface MessageAcknowledgment {
+  messageId: string;
+  timestamp: number;
+  status: 'sent' | 'delivered' | 'failed' | 'timeout';
+  retryCount: number;
+}
+
+// Queued message for offline scenarios
+export interface QueuedMessage {
+  id: string;
+  message: SyncWebviewWebSocketMessage;
+  priority: MessagePriority;
+  timestamp: number;
+  retryCount: number;
+  maxRetries: number;
+  requiresAck: boolean;
+  timeout?: number;
+}
+
+// Connection health metrics
+export interface ConnectionHealth {
+  state: ConnectionState;
+  lastConnected: number;
+  lastMessageSent: number;
+  lastMessageReceived: number;
+  reconnectAttempts: number;
+  latency: number;
+  messageQueueSize: number;
+  failedMessages: number;
+}
+
+// Message validation result
+export interface MessageValidationResult {
+  isValid: boolean;
+  errors: string[];
+  sanitizedMessage?: SyncWebviewWebSocketMessage;
+}
+
+// Recovery strategy configuration
+export interface RecoveryConfig {
+  maxReconnectAttempts: number;
+  reconnectInterval: number;
+  maxReconnectInterval: number;
+  backoffMultiplier: number;
+  messageTimeout: number;
+  maxQueueSize: number;
+  queuePersistence: boolean;
+}
+
 // Application event types for internal communication
 export type SyncWebviewAppEvent =
   | { type: 'START_RECORDING'; payload: { url: string } }
@@ -190,4 +246,7 @@ export type SyncWebviewAppEvent =
   | { type: 'SNAPSHOT_GENERATED'; payload: CompressedSnapshot }
   | { type: 'MOUSE_BATCH_RECEIVED'; payload: MouseMovementBatch }
   | { type: 'MOUSE_INTERACTION_RECEIVED'; payload: MouseInteractionState }
-  | { type: 'NAVIGATION_EVENT'; payload: NavigationEvent };
+  | { type: 'NAVIGATION_EVENT'; payload: NavigationEvent }
+  | { type: 'CONNECTION_STATE_CHANGED'; payload: { state: ConnectionState; health: ConnectionHealth } }
+  | { type: 'MESSAGE_ACKNOWLEDGED'; payload: MessageAcknowledgment }
+  | { type: 'MESSAGE_FAILED'; payload: { messageId: string; error: string } };

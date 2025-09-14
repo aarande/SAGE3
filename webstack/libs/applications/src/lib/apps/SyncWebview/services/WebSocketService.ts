@@ -15,17 +15,24 @@ import {
     PerformanceMetrics,
     CompressedSnapshot,
     SnapshotRequest,
-    NavigationEvent
+    NavigationEvent,
+    ConnectionState,
+    MessagePriority,
+    MessageAcknowledgment,
+    QueuedMessage,
+    ConnectionHealth,
+    MessageValidationResult,
+    RecoveryConfig
 } from '../types';
 
 /**
- * WebSocket communication service for SyncWebview
+ * Enhanced WebSocket communication service for SyncWebview
  * Handles event broadcasting and reception using SAGE3's application state system
+ * with message validation, queuing, acknowledgments, and connection recovery
  */
 export class WebSocketService {
     private appId: string;
     private userId: string;
-    private boardId: string;
     private isInitialized: boolean = false;
     private subscription: (() => void) | null = null;
     private lastMessageTimestamp: number = 0;
@@ -35,6 +42,37 @@ export class WebSocketService {
         processingDelay: 0,
         clientPerformance: 'medium'
     };
+
+    // Enhanced connection management
+    private connectionState: ConnectionState = 'disconnected';
+    private messageQueue: Map<string, QueuedMessage> = new Map();
+    private pendingAcknowledgments: Map<string, MessageAcknowledgment> = new Map();
+    private connectionHealth: ConnectionHealth = {
+        state: 'disconnected',
+        lastConnected: 0,
+        lastMessageSent: 0,
+        lastMessageReceived: 0,
+        reconnectAttempts: 0,
+        latency: 0,
+        messageQueueSize: 0,
+        failedMessages: 0
+    };
+
+    // Recovery configuration
+    private recoveryConfig: RecoveryConfig = {
+        maxReconnectAttempts: 10,
+        reconnectInterval: 1000,
+        maxReconnectInterval: 30000,
+        backoffMultiplier: 1.5,
+        messageTimeout: 10000,
+        maxQueueSize: 1000,
+        queuePersistence: true
+    };
+
+    // Timers for connection management
+    private reconnectTimer: NodeJS.Timeout | null = null;
+    private healthCheckTimer: NodeJS.Timeout | null = null;
+    private messageTimeoutTimer: NodeJS.Timeout | null = null;
 
     constructor(
         appId: string,
@@ -46,11 +84,19 @@ export class WebSocketService {
         private onMouseInteractionReceived: (interaction: MouseInteractionState) => void,
         private onError: (error: Error) => void,
         private onSnapshotRequested?: (request: SnapshotRequest) => void,
-        private onNavigationReceived?: (navigation: NavigationEvent) => void
+        private onNavigationReceived?: (navigation: NavigationEvent) => void,
+        private onConnectionStateChanged?: (state: ConnectionState, health: ConnectionHealth) => void,
+        private onMessageAcknowledged?: (ack: MessageAcknowledgment) => void
     ) {
         this.appId = appId;
         this.userId = userId;
-        this.boardId = boardId;
+        // boardId is kept for potential future use but not currently utilized
+
+        // Load persisted queue if available
+        this.loadPersistedQueue();
+        
+        // Start health monitoring
+        this.startHealthMonitoring();
     }
 
     /**
@@ -58,17 +104,29 @@ export class WebSocketService {
      */
     async initialize(): Promise<void> {
         try {
+            this.setConnectionState('connecting');
+
             // Subscribe to all apps in the board to listen for SyncWebview messages
             this.subscription = await SocketAPI.subscribe<any>(`/apps`, (message) => {
                 this.handleAppStateMessage(message);
             });
 
             this.isInitialized = true;
+            this.setConnectionState('connected');
+            this.connectionHealth.lastConnected = Date.now();
+            this.connectionHealth.reconnectAttempts = 0;
+
+            // Process any queued messages
+            await this.processMessageQueue();
 
             console.log('SyncWebview WebSocket service initialized with SAGE3 subscriptions');
         } catch (error) {
             console.error('SyncWebview: Failed to initialize WebSocket service:', error);
+            this.setConnectionState('error');
             this.onError(new Error('Failed to initialize WebSocket service'));
+            
+            // Attempt reconnection
+            this.scheduleReconnect();
             throw error;
         }
     }
@@ -78,6 +136,9 @@ export class WebSocketService {
      */
     private handleAppStateMessage(message: any): void {
         try {
+            // Update connection health
+            this.connectionHealth.lastMessageReceived = Date.now();
+
             // Check if this is an app update message
             if (message.type !== 'UPDATE') {
                 return;
@@ -95,11 +156,104 @@ export class WebSocketService {
                 // Check if this is a new message (avoid processing duplicates)
                 if (syncMessage.timestamp > this.lastMessageTimestamp) {
                     this.lastMessageTimestamp = syncMessage.timestamp;
-                    this.handleSyncWebviewMessage(syncMessage.syncwebviewMessage);
+                    
+                    // Validate message before processing
+                    const validation = this.validateMessage(syncMessage.syncwebviewMessage);
+                    if (validation.isValid && validation.sanitizedMessage) {
+                        this.handleSyncWebviewMessage(validation.sanitizedMessage);
+                    } else {
+                        console.warn('SyncWebview: Invalid message received:', validation.errors);
+                    }
                 }
             }
         } catch (error) {
             console.error('SyncWebview: Error handling app state message:', error);
+            this.onError(new Error('Failed to handle incoming message'));
+        }
+    }
+
+    /**
+     * Validate and sanitize incoming messages
+     */
+    private validateMessage(message: any): MessageValidationResult {
+        const errors: string[] = [];
+        
+        try {
+            // Basic structure validation
+            if (!message || typeof message !== 'object') {
+                errors.push('Message must be an object');
+                return { isValid: false, errors };
+            }
+
+            // Required fields validation
+            if (!message.type || typeof message.type !== 'string') {
+                errors.push('Message type is required and must be a string');
+            }
+
+            if (!message.appId || typeof message.appId !== 'string') {
+                errors.push('App ID is required and must be a string');
+            }
+
+            if (!message.userId || typeof message.userId !== 'string') {
+                errors.push('User ID is required and must be a string');
+            }
+
+            if (typeof message.timestamp !== 'number' || message.timestamp <= 0) {
+                errors.push('Timestamp must be a positive number');
+            }
+
+            // Message type validation
+            const validTypes = [
+                'syncwebview-event',
+                'syncwebview-snapshot',
+                'syncwebview-request-snapshot',
+                'syncwebview-mouse-batch',
+                'syncwebview-mouse-interaction',
+                'syncwebview-navigation'
+            ];
+
+            if (!validTypes.includes(message.type)) {
+                errors.push(`Invalid message type: ${message.type}`);
+            }
+
+            // Data validation based on message type
+            if (!message.data) {
+                errors.push('Message data is required');
+            }
+
+            // Sanitize message
+            const sanitizedMessage: SyncWebviewWebSocketMessage = {
+                type: message.type,
+                appId: String(message.appId).substring(0, 100), // Limit length
+                userId: String(message.userId).substring(0, 100),
+                timestamp: Number(message.timestamp),
+                data: message.data // TODO: Add deeper data validation based on type
+            };
+
+            // Additional security checks
+            if (message.userId === this.userId) {
+                errors.push('Cannot process messages from same user');
+            }
+
+            // Check message age (prevent replay attacks)
+            const messageAge = Date.now() - message.timestamp;
+            if (messageAge > 300000) { // 5 minutes
+                errors.push('Message is too old');
+            }
+
+            if (messageAge < -60000) { // 1 minute in future
+                errors.push('Message timestamp is too far in the future');
+            }
+
+            return {
+                isValid: errors.length === 0,
+                errors,
+                sanitizedMessage: errors.length === 0 ? sanitizedMessage : undefined
+            };
+
+        } catch (error) {
+            errors.push(`Validation error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            return { isValid: false, errors };
         }
     }
 
@@ -178,10 +332,9 @@ export class WebSocketService {
     /**
      * Broadcast an rrweb event to all other clients
      */
-    async broadcastEvent(event: SyncWebviewEvent): Promise<void> {
-        if (!this.isInitialized) {
-            console.warn('SyncWebview: WebSocket service not initialized');
-            return;
+    async broadcastEvent(event: SyncWebviewEvent, priority: MessagePriority = 'normal'): Promise<void> {
+        if (!this.isInitialized && this.connectionState !== 'connected') {
+            console.warn('SyncWebview: WebSocket service not ready, queuing event');
         }
 
         try {
@@ -193,7 +346,7 @@ export class WebSocketService {
                 userId: this.userId
             };
 
-            await this.sendMessage(message);
+            await this.sendMessage(message, priority, priority === 'critical');
 
         } catch (error) {
             console.error('SyncWebview: Failed to broadcast event:', error);
@@ -205,11 +358,6 @@ export class WebSocketService {
      * Broadcast a mouse movement batch to all other clients
      */
     async broadcastMouseBatch(batch: MouseMovementBatch): Promise<void> {
-        if (!this.isInitialized) {
-            console.warn('SyncWebview: WebSocket service not initialized');
-            return;
-        }
-
         try {
             const message: SyncWebviewWebSocketMessage = {
                 type: 'syncwebview-mouse-batch',
@@ -219,7 +367,8 @@ export class WebSocketService {
                 userId: this.userId
             };
 
-            await this.sendMessage(message);
+            // Mouse batches are low priority and don't need acknowledgment
+            await this.sendMessage(message, 'low', false);
 
         } catch (error) {
             console.error('SyncWebview: Failed to broadcast mouse batch:', error);
@@ -231,11 +380,6 @@ export class WebSocketService {
      * Broadcast a mouse interaction state to all other clients
      */
     async broadcastMouseInteraction(interaction: MouseInteractionState): Promise<void> {
-        if (!this.isInitialized) {
-            console.warn('SyncWebview: WebSocket service not initialized');
-            return;
-        }
-
         try {
             const message: SyncWebviewWebSocketMessage = {
                 type: 'syncwebview-mouse-interaction',
@@ -245,7 +389,8 @@ export class WebSocketService {
                 userId: this.userId
             };
 
-            await this.sendMessage(message);
+            // Mouse interactions are high priority for responsiveness
+            await this.sendMessage(message, 'high', false);
 
         } catch (error) {
             console.error('SyncWebview: Failed to broadcast mouse interaction:', error);
@@ -257,11 +402,6 @@ export class WebSocketService {
      * Broadcast a DOM snapshot to all other clients
      */
     async broadcastSnapshot(snapshot: CompressedSnapshot): Promise<void> {
-        if (!this.isInitialized) {
-            console.warn('SyncWebview: WebSocket service not initialized');
-            return;
-        }
-
         try {
             const message: SyncWebviewWebSocketMessage = {
                 type: 'syncwebview-snapshot',
@@ -271,7 +411,8 @@ export class WebSocketService {
                 userId: this.userId
             };
 
-            await this.sendMessage(message);
+            // Snapshots are critical for new participants
+            await this.sendMessage(message, 'critical', true);
 
         } catch (error) {
             console.error('SyncWebview: Failed to broadcast snapshot:', error);
@@ -283,11 +424,6 @@ export class WebSocketService {
      * Request a snapshot from other clients
      */
     async requestSnapshot(url?: string): Promise<void> {
-        if (!this.isInitialized) {
-            console.warn('SyncWebview: WebSocket service not initialized');
-            return;
-        }
-
         try {
             const request: SnapshotRequest = {
                 requesterId: this.userId,
@@ -303,7 +439,8 @@ export class WebSocketService {
                 userId: this.userId
             };
 
-            await this.sendMessage(message);
+            // Snapshot requests are high priority
+            await this.sendMessage(message, 'high', true);
 
         } catch (error) {
             console.error('SyncWebview: Failed to request snapshot:', error);
@@ -315,11 +452,6 @@ export class WebSocketService {
      * Broadcast a navigation event to all other clients
      */
     async broadcastNavigation(navigation: NavigationEvent): Promise<void> {
-        if (!this.isInitialized) {
-            console.warn('SyncWebview: WebSocket service not initialized');
-            return;
-        }
-
         try {
             const message: SyncWebviewWebSocketMessage = {
                 type: 'syncwebview-navigation',
@@ -329,7 +461,8 @@ export class WebSocketService {
                 userId: this.userId
             };
 
-            await this.sendMessage(message);
+            // Navigation events are critical for synchronization
+            await this.sendMessage(message, 'critical', true);
 
         } catch (error) {
             console.error('SyncWebview: Failed to broadcast navigation:', error);
@@ -338,51 +471,361 @@ export class WebSocketService {
     }
 
     /**
-     * Send a message through SAGE3's app state system with retry logic
+     * Send a message through SAGE3's app state system with enhanced error handling and queuing
      */
-    private async sendMessage(message: SyncWebviewWebSocketMessage): Promise<void> {
-        const maxRetries = 3;
-        let retryCount = 0;
+    private async sendMessage(
+        message: SyncWebviewWebSocketMessage, 
+        priority: MessagePriority = 'normal',
+        requiresAck: boolean = false
+    ): Promise<void> {
+        // Add unique message ID for tracking
+        const messageId = this.generateMessageId();
+        const queuedMessage: QueuedMessage = {
+            id: messageId,
+            message,
+            priority,
+            timestamp: Date.now(),
+            retryCount: 0,
+            maxRetries: this.getMaxRetriesForPriority(priority),
+            requiresAck,
+            timeout: requiresAck ? this.recoveryConfig.messageTimeout : undefined
+        };
 
-        while (retryCount < maxRetries) {
-            try {
-                // Create a temporary app state update to broadcast the message
-                const messageData = {
-                    syncwebviewMessage: message,
-                    timestamp: Date.now()
-                };
+        // If not connected, queue the message
+        if (this.connectionState !== 'connected') {
+            this.queueMessage(queuedMessage);
+            return;
+        }
 
-                // Update our app state with the sync message - this will be broadcast to all clients
-                await SocketAPI.sendRESTMessage(`/apps/${this.appId}`, 'PUT', {
-                    data: {
-                        state: {
-                            lastSyncMessage: messageData
-                        }
-                    }
-                });
-
-                // Update performance metrics on success
-                this.performanceMetrics.eventQueueSize++;
-                return; // Success, exit retry loop
-
-            } catch (error) {
-                retryCount++;
-                console.error(`SyncWebview: Failed to send message (attempt ${retryCount}/${maxRetries}):`, error);
-
-                if (retryCount >= maxRetries) {
-                    // Max retries reached, trigger error callback
-                    this.onError(new Error(`Failed to send message after ${maxRetries} attempts`));
-                    throw error;
-                }
-
-                // Wait before retrying (exponential backoff)
-                const delay = Math.min(1000 * Math.pow(2, retryCount - 1), 5000);
-                await new Promise(resolve => setTimeout(resolve, delay));
+        try {
+            await this.sendMessageDirect(queuedMessage);
+        } catch (error) {
+            console.error('SyncWebview: Failed to send message directly:', error);
+            
+            // Queue message for retry if it's important
+            if (priority === 'critical' || priority === 'high') {
+                this.queueMessage(queuedMessage);
+            } else {
+                this.connectionHealth.failedMessages++;
+                throw error;
             }
         }
     }
 
+    /**
+     * Send message directly without queuing
+     */
+    private async sendMessageDirect(queuedMessage: QueuedMessage): Promise<void> {
+        const { message, id, requiresAck } = queuedMessage;
 
+        try {
+            // Create a temporary app state update to broadcast the message
+            const messageData = {
+                syncwebviewMessage: message,
+                timestamp: Date.now(),
+                messageId: id
+            };
+
+            // Update our app state with the sync message - this will be broadcast to all clients
+            await SocketAPI.sendRESTMessage(`/apps/${this.appId}`, 'PUT', {
+                data: {
+                    state: {
+                        lastSyncMessage: messageData
+                    }
+                }
+            });
+
+            // Update connection health
+            this.connectionHealth.lastMessageSent = Date.now();
+            this.performanceMetrics.eventQueueSize++;
+
+            // Handle acknowledgment tracking
+            if (requiresAck) {
+                const ack: MessageAcknowledgment = {
+                    messageId: id,
+                    timestamp: Date.now(),
+                    status: 'sent',
+                    retryCount: queuedMessage.retryCount
+                };
+                
+                this.pendingAcknowledgments.set(id, ack);
+                
+                // Set timeout for acknowledgment
+                if (queuedMessage.timeout) {
+                    setTimeout(() => {
+                        this.handleMessageTimeout(id);
+                    }, queuedMessage.timeout);
+                }
+            }
+
+            console.log(`SyncWebview: Message sent successfully (ID: ${id})`);
+
+        } catch (error) {
+            queuedMessage.retryCount++;
+            
+            if (queuedMessage.retryCount >= queuedMessage.maxRetries) {
+                this.connectionHealth.failedMessages++;
+                console.error(`SyncWebview: Message failed after ${queuedMessage.maxRetries} attempts:`, error);
+                throw error;
+            }
+
+            // Exponential backoff for retry
+            const delay = Math.min(
+                this.recoveryConfig.reconnectInterval * Math.pow(this.recoveryConfig.backoffMultiplier, queuedMessage.retryCount - 1),
+                this.recoveryConfig.maxReconnectInterval
+            );
+
+            setTimeout(() => {
+                this.sendMessageDirect(queuedMessage).catch(console.error);
+            }, delay);
+        }
+    }
+
+    /**
+     * Queue message for later transmission
+     */
+    private queueMessage(message: QueuedMessage): void {
+        // Check queue size limit
+        if (this.messageQueue.size >= this.recoveryConfig.maxQueueSize) {
+            // Remove oldest low-priority message
+            this.removeOldestLowPriorityMessage();
+        }
+
+        this.messageQueue.set(message.id, message);
+        this.connectionHealth.messageQueueSize = this.messageQueue.size;
+
+        // Persist queue if enabled
+        if (this.recoveryConfig.queuePersistence) {
+            this.persistQueue();
+        }
+
+        console.log(`SyncWebview: Message queued (ID: ${message.id}, Priority: ${message.priority})`);
+    }
+
+    /**
+     * Process queued messages when connection is restored
+     */
+    private async processMessageQueue(): Promise<void> {
+        if (this.connectionState !== 'connected' || this.messageQueue.size === 0) {
+            return;
+        }
+
+        console.log(`SyncWebview: Processing ${this.messageQueue.size} queued messages`);
+
+        // Sort messages by priority and timestamp
+        const sortedMessages = Array.from(this.messageQueue.values()).sort((a, b) => {
+            const priorityOrder = { critical: 0, high: 1, normal: 2, low: 3 };
+            const priorityDiff = priorityOrder[a.priority] - priorityOrder[b.priority];
+            return priorityDiff !== 0 ? priorityDiff : a.timestamp - b.timestamp;
+        });
+
+        // Process messages in batches to avoid overwhelming the system
+        const batchSize = 10;
+        for (let i = 0; i < sortedMessages.length; i += batchSize) {
+            const batch = sortedMessages.slice(i, i + batchSize);
+            
+            // Process messages sequentially to avoid Babel compilation issues
+            for (const queuedMessage of batch) {
+                try {
+                    await this.sendMessageDirect(queuedMessage);
+                    this.messageQueue.delete(queuedMessage.id);
+                } catch (error) {
+                    console.error(`SyncWebview: Failed to process queued message ${queuedMessage.id}:`, error);
+                }
+            }
+
+            // Small delay between batches
+            if (i + batchSize < sortedMessages.length) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+        }
+
+        this.connectionHealth.messageQueueSize = this.messageQueue.size;
+
+        // Update persisted queue
+        if (this.recoveryConfig.queuePersistence) {
+            this.persistQueue();
+        }
+    }
+
+
+
+    /**
+     * Set connection state and notify listeners
+     */
+    private setConnectionState(state: ConnectionState): void {
+        if (this.connectionState !== state) {
+            this.connectionState = state;
+            this.connectionHealth.state = state;
+            
+            console.log(`SyncWebview: Connection state changed to ${state}`);
+            
+            if (this.onConnectionStateChanged) {
+                this.onConnectionStateChanged(state, this.connectionHealth);
+            }
+        }
+    }
+
+    /**
+     * Schedule reconnection attempt
+     */
+    private scheduleReconnect(): void {
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+        }
+
+        if (this.connectionHealth.reconnectAttempts >= this.recoveryConfig.maxReconnectAttempts) {
+            console.error('SyncWebview: Max reconnection attempts reached');
+            this.setConnectionState('error');
+            return;
+        }
+
+        const delay = Math.min(
+            this.recoveryConfig.reconnectInterval * Math.pow(this.recoveryConfig.backoffMultiplier, this.connectionHealth.reconnectAttempts),
+            this.recoveryConfig.maxReconnectInterval
+        );
+
+        this.reconnectTimer = setTimeout(() => {
+            this.attemptReconnect();
+        }, delay);
+
+        console.log(`SyncWebview: Reconnection scheduled in ${delay}ms (attempt ${this.connectionHealth.reconnectAttempts + 1})`);
+    }
+
+    /**
+     * Attempt to reconnect
+     */
+    private async attemptReconnect(): Promise<void> {
+        this.connectionHealth.reconnectAttempts++;
+        this.setConnectionState('reconnecting');
+
+        try {
+            await this.initialize();
+            console.log('SyncWebview: Reconnection successful');
+        } catch (error) {
+            console.error('SyncWebview: Reconnection failed:', error);
+            this.scheduleReconnect();
+        }
+    }
+
+    /**
+     * Start health monitoring
+     */
+    private startHealthMonitoring(): void {
+        if (this.healthCheckTimer) {
+            clearInterval(this.healthCheckTimer);
+        }
+
+        this.healthCheckTimer = setInterval(() => {
+            this.performHealthCheck();
+        }, 30000); // Check every 30 seconds
+    }
+
+    /**
+     * Perform connection health check
+     */
+    private performHealthCheck(): void {
+        const now = Date.now();
+        const timeSinceLastMessage = now - this.connectionHealth.lastMessageReceived;
+        
+        // If no messages received for 2 minutes and we think we're connected, test connection
+        if (timeSinceLastMessage > 120000 && this.connectionState === 'connected') {
+            this.testConnection().then(isHealthy => {
+                if (!isHealthy) {
+                    console.warn('SyncWebview: Connection health check failed, attempting reconnection');
+                    this.setConnectionState('error');
+                    this.scheduleReconnect();
+                }
+            });
+        }
+
+        // Calculate latency if we have recent message activity
+        if (this.connectionHealth.lastMessageSent > 0 && this.connectionHealth.lastMessageReceived > 0) {
+            this.connectionHealth.latency = Math.abs(this.connectionHealth.lastMessageReceived - this.connectionHealth.lastMessageSent);
+        }
+    }
+
+    /**
+     * Handle message timeout
+     */
+    private handleMessageTimeout(messageId: string): void {
+        const ack = this.pendingAcknowledgments.get(messageId);
+        if (ack && ack.status === 'sent') {
+            ack.status = 'timeout';
+            console.warn(`SyncWebview: Message timeout (ID: ${messageId})`);
+            
+            if (this.onMessageAcknowledged) {
+                this.onMessageAcknowledged(ack);
+            }
+            
+            this.pendingAcknowledgments.delete(messageId);
+        }
+    }
+
+    /**
+     * Get max retries based on message priority
+     */
+    private getMaxRetriesForPriority(priority: MessagePriority): number {
+        switch (priority) {
+            case 'critical': return 5;
+            case 'high': return 3;
+            case 'normal': return 2;
+            case 'low': return 1;
+            default: return 2;
+        }
+    }
+
+    /**
+     * Remove oldest low-priority message from queue
+     */
+    private removeOldestLowPriorityMessage(): void {
+        let oldestLowPriority: QueuedMessage | null = null;
+        let oldestId: string | null = null;
+
+        this.messageQueue.forEach((message, id) => {
+            if (message.priority === 'low' || message.priority === 'normal') {
+                if (!oldestLowPriority || message.timestamp < oldestLowPriority.timestamp) {
+                    oldestLowPriority = message;
+                    oldestId = id;
+                }
+            }
+        });
+
+        if (oldestId) {
+            this.messageQueue.delete(oldestId);
+            console.log(`SyncWebview: Removed oldest low-priority message from queue (ID: ${oldestId})`);
+        }
+    }
+
+    /**
+     * Persist message queue to local storage
+     */
+    private persistQueue(): void {
+        try {
+            const queueData = Array.from(this.messageQueue.entries());
+            localStorage.setItem(`syncwebview_queue_${this.appId}`, JSON.stringify(queueData));
+        } catch (error) {
+            console.warn('SyncWebview: Failed to persist message queue:', error);
+        }
+    }
+
+    /**
+     * Load persisted message queue from local storage
+     */
+    private loadPersistedQueue(): void {
+        try {
+            const queueData = localStorage.getItem(`syncwebview_queue_${this.appId}`);
+            if (queueData) {
+                const entries: [string, QueuedMessage][] = JSON.parse(queueData);
+                this.messageQueue = new Map(entries);
+                this.connectionHealth.messageQueueSize = this.messageQueue.size;
+                
+                console.log(`SyncWebview: Loaded ${this.messageQueue.size} messages from persisted queue`);
+            }
+        } catch (error) {
+            console.warn('SyncWebview: Failed to load persisted message queue:', error);
+        }
+    }
 
     /**
      * Update performance metrics
@@ -458,28 +901,121 @@ export class WebSocketService {
     /**
      * Get connection health status
      */
-    getConnectionHealth(): {
-        isConnected: boolean;
-        lastMessageTime: number;
-        performanceMetrics: PerformanceMetrics;
+    getConnectionHealth(): ConnectionHealth {
+        return { ...this.connectionHealth };
+    }
+
+    /**
+     * Get connection state
+     */
+    getConnectionState(): ConnectionState {
+        return this.connectionState;
+    }
+
+    /**
+     * Get message queue status
+     */
+    getMessageQueueStatus(): {
+        size: number;
+        pendingAcknowledgments: number;
+        oldestMessage?: number;
     } {
+        let oldestTimestamp: number | undefined;
+        
+        if (this.messageQueue.size > 0) {
+            oldestTimestamp = Math.min(...Array.from(this.messageQueue.values()).map(m => m.timestamp));
+        }
+
         return {
-            isConnected: this.isInitialized,
-            lastMessageTime: this.lastMessageTimestamp,
-            performanceMetrics: this.getPerformanceMetrics()
+            size: this.messageQueue.size,
+            pendingAcknowledgments: this.pendingAcknowledgments.size,
+            oldestMessage: oldestTimestamp
         };
+    }
+
+    /**
+     * Force reconnection
+     */
+    async forceReconnect(): Promise<void> {
+        console.log('SyncWebview: Forcing reconnection');
+        
+        // Clean up current connection
+        if (this.subscription) {
+            this.subscription();
+            this.subscription = null;
+        }
+        
+        this.isInitialized = false;
+        this.setConnectionState('disconnected');
+        
+        // Reset reconnection attempts
+        this.connectionHealth.reconnectAttempts = 0;
+        
+        // Attempt to reconnect
+        await this.attemptReconnect();
+    }
+
+    /**
+     * Clear message queue
+     */
+    clearMessageQueue(): void {
+        const queueSize = this.messageQueue.size;
+        this.messageQueue.clear();
+        this.connectionHealth.messageQueueSize = 0;
+        
+        // Clear persisted queue
+        if (this.recoveryConfig.queuePersistence) {
+            try {
+                localStorage.removeItem(`syncwebview_queue_${this.appId}`);
+            } catch (error) {
+                console.warn('SyncWebview: Failed to clear persisted queue:', error);
+            }
+        }
+        
+        console.log(`SyncWebview: Cleared ${queueSize} messages from queue`);
+    }
+
+    /**
+     * Update recovery configuration
+     */
+    updateRecoveryConfig(config: Partial<RecoveryConfig>): void {
+        this.recoveryConfig = { ...this.recoveryConfig, ...config };
+        console.log('SyncWebview: Recovery configuration updated:', this.recoveryConfig);
     }
 
     /**
      * Clean up resources
      */
     destroy(): void {
+        // Clean up subscription
         if (this.subscription) {
             this.subscription();
             this.subscription = null;
         }
 
+        // Clear timers
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+
+        if (this.healthCheckTimer) {
+            clearInterval(this.healthCheckTimer);
+            this.healthCheckTimer = null;
+        }
+
+        if (this.messageTimeoutTimer) {
+            clearTimeout(this.messageTimeoutTimer);
+            this.messageTimeoutTimer = null;
+        }
+
+        // Clear queues and acknowledgments
+        this.messageQueue.clear();
+        this.pendingAcknowledgments.clear();
+
+        // Reset state
         this.isInitialized = false;
+        this.setConnectionState('disconnected');
 
         console.log('SyncWebview: WebSocket service destroyed');
     }
