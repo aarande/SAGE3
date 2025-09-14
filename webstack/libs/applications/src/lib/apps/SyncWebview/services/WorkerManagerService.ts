@@ -277,6 +277,11 @@ export class WorkerManagerService {
     // Handle the processed mouse interaction
   }
 
+  // Throttling for network latency updates
+  private lastLatencyUpdate: number = 0;
+  private latencyUpdateInterval: number = 2000; // Update every 2 seconds max
+  private lastSentLatency: number = -1;
+
   /**
    * Track network latency for performance monitoring
    */
@@ -291,7 +296,7 @@ export class WorkerManagerService {
         this.performanceMonitor.networkLatencies = this.performanceMonitor.networkLatencies.slice(-this.performanceMonitor.maxLatencyHistory);
       }
       
-      // Send average latency back to worker
+      // Send average latency back to worker (throttled)
       const avgLatency = this.performanceMonitor.networkLatencies.reduce((a, b) => a + b, 0) / this.performanceMonitor.networkLatencies.length;
       this.updateWorkerNetworkLatency(avgLatency);
       
@@ -301,10 +306,23 @@ export class WorkerManagerService {
   }
 
   /**
-   * Update worker with current network latency
+   * Update worker with current network latency (throttled to prevent spam)
    */
   private updateWorkerNetworkLatency(latency: number): void {
     if (!this.worker || !this.isInitialized) return;
+
+    const now = Date.now();
+    const latencyChange = Math.abs(latency - this.lastSentLatency);
+    
+    // Only update if enough time has passed OR there's a significant change
+    if (now - this.lastLatencyUpdate < this.latencyUpdateInterval && latencyChange < 10) {
+      return; // Skip update to prevent spam
+    }
+
+    // Only update if there's a meaningful change (>5ms difference or >20% change)
+    if (this.lastSentLatency >= 0 && latencyChange < 5 && latencyChange / this.lastSentLatency < 0.2) {
+      return; // Skip update for minor changes
+    }
 
     const message: WorkerMessage = {
       type: 'config',
@@ -313,6 +331,8 @@ export class WorkerManagerService {
     };
 
     this.worker.postMessage(message);
+    this.lastLatencyUpdate = now;
+    this.lastSentLatency = latency;
   }
 
   /**
@@ -358,6 +378,7 @@ export class WorkerManagerService {
             lastAdaptation: Date.now(),
             adaptationInterval: 1000,
           };
+          this.lastConfigUpdate = 0;
           this.startBatchProcessor();
         }
 
@@ -455,9 +476,20 @@ export class WorkerManagerService {
         }
 
         updateConfig(config) {
-          console.log('EventProcessor: Configuration updated:', config);
+          // Apply configuration changes first
           if (config.networkLatency !== undefined) {
             this.performanceMetrics.networkLatency = config.networkLatency;
+          }
+          
+          // Throttle logging to prevent spam
+          const now = Date.now();
+          if (!this.lastConfigUpdate || now - this.lastConfigUpdate > 2000) {
+            console.log('EventProcessor: Configuration updated:', config);
+            this.lastConfigUpdate = now;
+          } else if (now - this.lastConfigUpdate < 100) {
+            // If config updates are happening too frequently, it might indicate a loop
+            console.warn('EventProcessor: Rapid configuration updates detected, possible loop');
+            return; // Skip logging but still apply config
           }
         }
 
@@ -720,6 +752,7 @@ export class WorkerManagerService {
         adaptPerformance() {
           const now = Date.now();
           
+          // Increase adaptation interval to prevent runaway adaptations
           if (now - this.adaptiveSampling.lastAdaptation < this.adaptiveSampling.adaptationInterval) {
             return;
           }
@@ -731,20 +764,24 @@ export class WorkerManagerService {
           let needsRestart = false;
           const oldInterval = this.batchInterval;
           
+          // Only adapt if there's a significant performance issue or improvement opportunity
           if (clientPerformance === 'low' || queueSize > 500) {
-            this.batchInterval = Math.min(this.batchInterval * 1.5, this.MAX_BATCH_INTERVAL);
-            this.adaptiveSampling.mouseSamplingRate = Math.min(this.adaptiveSampling.mouseSamplingRate * 1.5, 500);
-            this.adaptiveSampling.eventDropRate = Math.min(this.adaptiveSampling.eventDropRate + 0.1, 0.5);
-          } else if (clientPerformance === 'high' && queueSize < 100) {
-            this.batchInterval = Math.max(this.batchInterval * 0.8, this.MIN_BATCH_INTERVAL);
-            this.adaptiveSampling.mouseSamplingRate = Math.max(this.adaptiveSampling.mouseSamplingRate * 0.8, 50);
-            this.adaptiveSampling.eventDropRate = Math.max(this.adaptiveSampling.eventDropRate - 0.05, 0);
+            this.batchInterval = Math.min(this.batchInterval * 1.2, this.MAX_BATCH_INTERVAL); // Reduced from 1.5 to 1.2
+            this.adaptiveSampling.mouseSamplingRate = Math.min(this.adaptiveSampling.mouseSamplingRate * 1.2, 500);
+            this.adaptiveSampling.eventDropRate = Math.min(this.adaptiveSampling.eventDropRate + 0.05, 0.3); // Reduced max from 0.5 to 0.3
+          } else if (clientPerformance === 'high' && queueSize < 50 && this.batchInterval > this.MIN_BATCH_INTERVAL * 2) {
+            // Only optimize if we're significantly above minimum and queue is very low
+            this.batchInterval = Math.max(this.batchInterval * 0.9, this.MIN_BATCH_INTERVAL); // Reduced from 0.8 to 0.9
+            this.adaptiveSampling.mouseSamplingRate = Math.max(this.adaptiveSampling.mouseSamplingRate * 0.9, 50);
+            this.adaptiveSampling.eventDropRate = Math.max(this.adaptiveSampling.eventDropRate - 0.02, 0); // Reduced from 0.05 to 0.02
           }
 
-          if (Math.abs(oldInterval - this.batchInterval) > 10) {
+          // Only restart if there's a significant change
+          if (Math.abs(oldInterval - this.batchInterval) > 20) { // Increased threshold from 10 to 20
             needsRestart = true;
           }
 
+          // Emergency throttling for severe performance issues
           if (queueSize > 800 || processingDelay > 100) {
             this.batchInterval = this.MAX_BATCH_INTERVAL;
             this.adaptiveSampling.eventDropRate = 0.7;
@@ -762,16 +799,20 @@ export class WorkerManagerService {
             this.restartBatchProcessor();
           }
 
+          // Increase adaptation interval to prevent rapid adaptations
           this.adaptiveSampling.lastAdaptation = now;
+          this.adaptiveSampling.adaptationInterval = Math.min(this.adaptiveSampling.adaptationInterval * 1.1, 5000); // Gradually increase interval up to 5 seconds
 
-          if (oldInterval !== this.batchInterval) {
+          // Only log significant changes to reduce noise
+          if (Math.abs(oldInterval - this.batchInterval) > 5) {
             console.log('EventProcessor: Performance adapted', {
               oldInterval,
               newInterval: this.batchInterval,
               mouseSamplingRate: this.adaptiveSampling.mouseSamplingRate,
               eventDropRate: this.adaptiveSampling.eventDropRate,
               queueSize,
-              clientPerformance
+              clientPerformance,
+              nextAdaptationIn: this.adaptiveSampling.adaptationInterval
             });
           }
         }

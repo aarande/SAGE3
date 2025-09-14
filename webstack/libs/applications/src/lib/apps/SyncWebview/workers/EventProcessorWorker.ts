@@ -45,6 +45,7 @@ class EventProcessor {
     lastAdaptation: Date.now(),
     adaptationInterval: 1000, // Adapt every second
   };
+  private lastConfigUpdate = 0;
 
   constructor() {
     this.startBatchProcessor();
@@ -145,8 +146,23 @@ class EventProcessor {
    * Update worker configuration
    */
   private updateConfig(config: any): void {
-    console.log('EventProcessor: Configuration updated:', config);
-    // Apply configuration changes
+    // Prevent excessive logging that could indicate a loop
+    const now = Date.now();
+    
+    // Apply configuration changes first
+    if (config.networkLatency !== undefined) {
+      this.performanceMetrics.networkLatency = config.networkLatency;
+    }
+    
+    // Throttle logging to prevent spam
+    if (!this.lastConfigUpdate || now - this.lastConfigUpdate > 2000) {
+      console.log('EventProcessor: Configuration updated:', config);
+      this.lastConfigUpdate = now;
+    } else if (now - this.lastConfigUpdate < 100) {
+      // If config updates are happening too frequently, it might indicate a loop
+      console.warn('EventProcessor: Rapid configuration updates detected, possible loop');
+      return; // Skip logging but still apply config
+    }
   }
 
   /**
@@ -414,7 +430,7 @@ class EventProcessor {
   private adaptPerformance(): void {
     const now = Date.now();
     
-    // Only adapt every second to avoid thrashing
+    // Increase adaptation interval to prevent runaway adaptations
     if (now - this.adaptiveSampling.lastAdaptation < this.adaptiveSampling.adaptationInterval) {
       return;
     }
@@ -428,20 +444,21 @@ class EventProcessor {
     // Adapt batch interval based on performance
     const oldInterval = this.batchInterval;
     
+    // Only adapt if there's a significant performance issue or improvement opportunity
     if (clientPerformance === 'low' || queueSize > 500) {
-      // Reduce frequency under load
-      this.batchInterval = Math.min(this.batchInterval * 1.5, this.MAX_BATCH_INTERVAL);
-      this.adaptiveSampling.mouseSamplingRate = Math.min(this.adaptiveSampling.mouseSamplingRate * 1.5, 500);
-      this.adaptiveSampling.eventDropRate = Math.min(this.adaptiveSampling.eventDropRate + 0.1, 0.5);
-    } else if (clientPerformance === 'high' && queueSize < 100) {
-      // Increase frequency when performance is good
-      this.batchInterval = Math.max(this.batchInterval * 0.8, this.MIN_BATCH_INTERVAL);
-      this.adaptiveSampling.mouseSamplingRate = Math.max(this.adaptiveSampling.mouseSamplingRate * 0.8, 50);
-      this.adaptiveSampling.eventDropRate = Math.max(this.adaptiveSampling.eventDropRate - 0.05, 0);
+      // Reduce frequency under load (more conservative)
+      this.batchInterval = Math.min(this.batchInterval * 1.2, this.MAX_BATCH_INTERVAL); // Reduced from 1.5 to 1.2
+      this.adaptiveSampling.mouseSamplingRate = Math.min(this.adaptiveSampling.mouseSamplingRate * 1.2, 500);
+      this.adaptiveSampling.eventDropRate = Math.min(this.adaptiveSampling.eventDropRate + 0.05, 0.3); // Reduced max from 0.5 to 0.3
+    } else if (clientPerformance === 'high' && queueSize < 50 && this.batchInterval > this.MIN_BATCH_INTERVAL * 2) {
+      // Only optimize if we're significantly above minimum and queue is very low
+      this.batchInterval = Math.max(this.batchInterval * 0.9, this.MIN_BATCH_INTERVAL); // Reduced from 0.8 to 0.9
+      this.adaptiveSampling.mouseSamplingRate = Math.max(this.adaptiveSampling.mouseSamplingRate * 0.9, 50);
+      this.adaptiveSampling.eventDropRate = Math.max(this.adaptiveSampling.eventDropRate - 0.02, 0); // Reduced from 0.05 to 0.02
     }
 
-    // Restart timer if interval changed significantly
-    if (Math.abs(oldInterval - this.batchInterval) > 10) {
+    // Only restart if there's a significant change
+    if (Math.abs(oldInterval - this.batchInterval) > 20) { // Increased threshold from 10 to 20
       needsRestart = true;
     }
 
@@ -463,17 +480,20 @@ class EventProcessor {
       this.restartBatchProcessor();
     }
 
+    // Increase adaptation interval to prevent rapid adaptations
     this.adaptiveSampling.lastAdaptation = now;
+    this.adaptiveSampling.adaptationInterval = Math.min(this.adaptiveSampling.adaptationInterval * 1.1, 5000); // Gradually increase interval up to 5 seconds
 
-    // Log adaptation for debugging
-    if (oldInterval !== this.batchInterval) {
+    // Only log significant changes to reduce noise
+    if (Math.abs(oldInterval - this.batchInterval) > 5) {
       console.log('EventProcessor: Performance adapted', {
         oldInterval,
         newInterval: this.batchInterval,
         mouseSamplingRate: this.adaptiveSampling.mouseSamplingRate,
         eventDropRate: this.adaptiveSampling.eventDropRate,
         queueSize,
-        clientPerformance
+        clientPerformance,
+        nextAdaptationIn: this.adaptiveSampling.adaptationInterval
       });
     }
   }

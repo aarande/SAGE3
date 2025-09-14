@@ -6,7 +6,7 @@
  * the file LICENSE, distributed as part of this software.
  */
 
-import { useRef, useState, useCallback, useEffect } from 'react';
+import { useRef, useState, useCallback, useEffect, useMemo } from 'react';
 import { useParams } from 'react-router';
 
 import { 
@@ -76,6 +76,25 @@ function AppComponent(props: App): JSX.Element {
   const [zoom, setZoom] = useState<number>(s.zoom);
   const [canGoBack, setCanGoBack] = useState<boolean>(s.navigation?.canGoBack || false);
   const [canGoForward, setCanGoForward] = useState<boolean>(s.navigation?.canGoForward || false);
+  
+  // Flag to prevent navigation broadcast loops
+  const isNavigatingFromRemote = useRef<boolean>(false);
+  
+  // Refs for current values to avoid recreating webview callback
+  const currentUrl = useRef<string>(url);
+  const currentNavigation = useRef(s.navigation);
+  
+  // Flag to track if webview has been initialized
+  const webviewInitialized = useRef<boolean>(false);
+  
+  // Update refs when values change
+  useEffect(() => {
+    currentUrl.current = url;
+  }, [url]);
+  
+  useEffect(() => {
+    currentNavigation.current = s.navigation;
+  }, [s.navigation]);
 
   // rrweb Services
   const recorderServiceRef = useRef<EventRecorderService | null>(null);
@@ -292,17 +311,22 @@ function AppComponent(props: App): JSX.Element {
     }
   }, [canGoBack, canGoForward, props._id, updateState, s.navigation]);
 
-  // Init the webview (Electron only)
+  // Stable webview ref callback
   const setWebviewRef = useCallback((node: WebviewTag) => {
+    if (!node || webviewInitialized.current) return;
+
+    webviewRef.current = node;
+    const webview = node;
+    
     // event did-attach callback
     const didAttachCallback = (evt: any) => {
-      webviewRef.current?.removeEventListener('did-attach', didAttachCallback);
+      webview.removeEventListener('did-attach', didAttachCallback);
       setAttached(true);
     };
 
     // event dom-ready callback
     const domReadyCallback = (evt: any) => {
-      webviewRef.current?.removeEventListener('dom-ready', domReadyCallback);
+      webview.removeEventListener('dom-ready', domReadyCallback);
       setDomReady(true);
     };
 
@@ -311,13 +335,13 @@ function AppComponent(props: App): JSX.Element {
       console.log('SyncWebview: Navigation completed to:', event.url);
       
       // Update URL in state if it changed
-      if (event.url !== url) {
+      if (event.url !== currentUrl.current) {
         setUrl(event.url);
         updateState(props._id, { url: event.url });
         
         // Update navigation history
-        const currentHistory = s.navigation?.history || [];
-        const currentIndex = s.navigation?.currentIndex || 0;
+        const currentHistory = currentNavigation.current?.history || [];
+        const currentIndex = currentNavigation.current?.currentIndex || 0;
         
         // Add new URL to history (remove any forward history)
         const newHistory = [...currentHistory.slice(0, currentIndex + 1), event.url];
@@ -325,23 +349,28 @@ function AppComponent(props: App): JSX.Element {
         
         updateState(props._id, {
           navigation: {
-            ...s.navigation,
+            ...currentNavigation.current,
             history: newHistory,
             currentIndex: newIndex,
           }
         });
         
-        // Broadcast navigation event
-        const navigationEvent: NavigationEvent = {
-          type: 'navigate',
-          url: event.url,
-          timestamp: Date.now(),
-          userId: user?._id || 'anonymous',
-          sessionId: props._id
-        };
-        
-        if (webSocketServiceRef.current && webSocketServiceRef.current.getIsInitialized()) {
-          webSocketServiceRef.current.broadcastNavigation(navigationEvent);
+        // Only broadcast navigation event if this wasn't triggered by a remote navigation
+        if (!isNavigatingFromRemote.current) {
+          const navigationEvent: NavigationEvent = {
+            type: 'navigate',
+            url: event.url,
+            timestamp: Date.now(),
+            userId: user?._id || 'anonymous',
+            sessionId: props._id
+          };
+          
+          if (webSocketServiceRef.current && webSocketServiceRef.current.getIsInitialized()) {
+            webSocketServiceRef.current.broadcastNavigation(navigationEvent);
+          }
+        } else {
+          // Reset the flag after handling remote navigation
+          isNavigatingFromRemote.current = false;
         }
       }
       
@@ -354,31 +383,34 @@ function AppComponent(props: App): JSX.Element {
       updateNavigationState();
     };
 
-    if (node) {
-      webviewRef.current = node;
-      const webview = webviewRef.current;
+    const titleUpdated = (event: any) => {
+      // Update the app title
+      update(props._id, { title: event.title });
+    };
 
+    try {
       // Set partition for isolation
-      webview.partition = 'persist:syncwebview_' + props._id;
+      const expectedPartition = 'persist:syncwebview_' + props._id;
+      webview.partition = expectedPartition;
 
-      // Callback when the webview is ready
+      // Add event listeners
       webview.addEventListener('dom-ready', domReadyCallback);
       webview.addEventListener('did-attach', didAttachCallback);
-
-      // Navigation event listeners
       webview.addEventListener('did-navigate', didNavigate);
       webview.addEventListener('did-navigate-in-page', didNavigateInPage);
-
-      const titleUpdated = (event: any) => {
-        // Update the app title
-        update(props._id, { title: event.title });
-      };
       webview.addEventListener('page-title-updated', titleUpdated);
 
-      // After the partition has been set, you can navigate
-      webview.src = url;
+      // Navigate to initial URL
+      webview.src = currentUrl.current;
+      
+      // Mark as initialized
+      webviewInitialized.current = true;
+      
+      console.log('SyncWebview: Webview initialized with partition:', expectedPartition);
+    } catch (error) {
+      console.error('SyncWebview: Error initializing webview:', error);
     }
-  }, [props._id, update, url, updateNavigationState, user?._id, s.navigation, updateState]);
+  }, []); // Empty dependency array - callback never changes
 
   // Load URL in webview (Electron only)
   const loadURL = useCallback((newUrl: string) => {
@@ -416,6 +448,8 @@ function AppComponent(props: App): JSX.Element {
   useEffect(() => {
     if (s.url !== url) {
       if (isElectron()) {
+        // Set flag to prevent broadcasting when URL is updated from backend state
+        isNavigatingFromRemote.current = true;
         loadURL(s.url);
       }
       setUrl(s.url);
@@ -775,28 +809,44 @@ function AppComponent(props: App): JSX.Element {
     }
 
     try {
+      // Set flag to prevent broadcasting when handling remote navigation
+      isNavigatingFromRemote.current = true;
+      
       switch (navigation.type) {
         case 'navigate':
           if (navigation.url && navigation.url !== url) {
             loadURL(navigation.url);
+          } else {
+            // Reset flag if we're not actually navigating
+            isNavigatingFromRemote.current = false;
           }
           break;
         case 'back':
           if (webviewRef.current.canGoBack()) {
             webviewRef.current.goBack();
+          } else {
+            isNavigatingFromRemote.current = false;
           }
           break;
         case 'forward':
           if (webviewRef.current.canGoForward()) {
             webviewRef.current.goForward();
+          } else {
+            isNavigatingFromRemote.current = false;
           }
           break;
         case 'refresh':
           webviewRef.current.reload();
           break;
+        default:
+          // Reset flag for unknown navigation types
+          isNavigatingFromRemote.current = false;
+          break;
       }
     } catch (error) {
       console.error('SyncWebview: Error handling navigation event:', error);
+      // Reset flag on error to prevent it from getting stuck
+      isNavigatingFromRemote.current = false;
     }
   }, [url, loadURL, domReady, attached]);
 
@@ -840,13 +890,13 @@ function AppComponent(props: App): JSX.Element {
   const isFocused = useUIStore((state) => state.focusedAppId === props._id);
   const { width: winWidth, height: winHeight } = useWindowResize();
 
-  const webviewStyle: React.CSSProperties = {
+  const webviewStyle: React.CSSProperties = useMemo(() => ({
     width: isFocused ? winWidth + 'px' : props.data.size.width + 'px',
     height: isFocused ? winHeight + 'px' : props.data.size.height + 'px', // Use full application height
     border: 'none',
     background: 'white',
     visibility: boardDragging ? 'hidden' : 'visible',
-  };
+  }), [isFocused, winWidth, winHeight, props.data.size.width, props.data.size.height, boardDragging]);
 
   return (
     <AppWindow app={props} hideBackgroundIcon={MdSync}>
