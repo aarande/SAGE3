@@ -9,5 +9,7 @@
 export { EventRecorderService } from './EventRecorderService';
 export { WorkerManagerService } from './WorkerManagerService';
 export { MouseOptimizationService } from './MouseOptimizationService';
+export { WebSocketService } from './WebSocketService';
+export { EventReplayService } from './EventReplayService';
 export { PerformanceMonitor } from '../utils/PerformanceMonitor';
 export type { PerformanceSummary, PerformanceTrend, PerformanceAlert } from '../utils/PerformanceMonitor';

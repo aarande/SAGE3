@@ -42,9 +42,11 @@ import { useAppStore, useUser, processContentURL, useHexColor, useUIStore, useWi
 import { App } from '../../schema';
 import { state as AppState } from './index';
 import { AppWindow, ElectronRequired } from '../../components';
-import { SyncWebviewEvent, SyncWebviewWebSocketMessage } from './types';
+import { SyncWebviewEvent, SyncWebviewWebSocketMessage, MouseMovementBatch, MouseInteractionState } from './types';
 import { EventRecorderService } from './services/EventRecorderService';
 import { WorkerManagerService } from './services/WorkerManagerService';
+import { WebSocketService } from './services/WebSocketService';
+import { EventReplayService } from './services/EventReplayService';
 
 // Electron webview type
 // @ts-ignore
@@ -76,7 +78,10 @@ function AppComponent(props: App): JSX.Element {
   // rrweb Services
   const recorderServiceRef = useRef<EventRecorderService | null>(null);
   const workerManagerRef = useRef<WorkerManagerService | null>(null);
+  const webSocketServiceRef = useRef<WebSocketService | null>(null);
+  const replayServiceRef = useRef<EventReplayService | null>(null);
   const [recordingError, setRecordingError] = useState<string | null>(null);
+  const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
 
   // UI
   const boardDragging = useUIStore((state) => state.boardDragging);
@@ -106,6 +111,31 @@ function AppComponent(props: App): JSX.Element {
 
     const initializeServices = async () => {
       try {
+        setConnectionStatus('connecting');
+
+        // Initialize WebSocket Service first
+        const webSocketService = new WebSocketService(
+          props._id,
+          user?.data._id || 'anonymous',
+          boardId || 'unknown',
+          handleEventReceived,
+          handleSnapshotReceived,
+          handleMouseBatchReceived,
+          handleMouseInteractionReceived,
+          handleWebSocketError,
+          handleSnapshotRequested
+        );
+        await webSocketService.initialize();
+        webSocketServiceRef.current = webSocketService;
+
+        // Initialize Event Replay Service
+        const replayService = new EventReplayService(
+          handleReplayError,
+          handleReplayComplete
+        );
+        // We'll initialize this when we have a target element
+        replayServiceRef.current = replayService;
+
         // Initialize Worker Manager
         const workerManager = new WorkerManagerService(
           handleRecordedEvent,
@@ -125,13 +155,15 @@ function AppComponent(props: App): JSX.Element {
         );
         recorderServiceRef.current = recorder;
 
-        console.log('SyncWebview: rrweb services initialized');
+        setConnectionStatus('connected');
+        console.log('SyncWebview: All services initialized');
       } catch (error) {
-        console.error('SyncWebview: Failed to initialize rrweb services:', error);
-        setRecordingError('Failed to initialize recording services');
+        console.error('SyncWebview: Failed to initialize services:', error);
+        setRecordingError('Failed to initialize services');
+        setConnectionStatus('disconnected');
         toast({
-          title: 'Recording Error',
-          description: 'Failed to initialize recording services',
+          title: 'Initialization Error',
+          description: 'Failed to initialize SyncWebview services',
           status: 'error',
           duration: 5000,
         });
@@ -148,36 +180,60 @@ function AppComponent(props: App): JSX.Element {
       if (workerManagerRef.current) {
         workerManagerRef.current.terminate();
       }
+      if (webSocketServiceRef.current) {
+        webSocketServiceRef.current.destroy();
+      }
+      if (replayServiceRef.current) {
+        replayServiceRef.current.stopReplaying();
+      }
     };
-  }, [props._id, user?.data.name, toast]);
+  }, [props._id, user?.data._id, user?.data.name, boardId, toast]);
 
-  // Auto-start recording when webview is ready
+  // Auto-start recording and replay when webview is ready
   useEffect(() => {
     if (!recorderServiceRef.current || !isElectron() || !domReady || !attached || !webviewRef.current) return;
 
-    // Start recording automatically when webview is ready
-    if (!recorderServiceRef.current.getIsRecording()) {
+    const initializeRecordingAndReplay = async () => {
       try {
-        // Add a small delay to ensure webview is fully loaded
-        setTimeout(() => {
-          if (recorderServiceRef.current && !recorderServiceRef.current.getIsRecording()) {
-            recorderServiceRef.current.startRecording({
-              maskInputOptions: {
-                password: s.privacy.maskPasswords,
-              },
-            });
-            setRecordingError(null);
-            // Update state to reflect that recording has started
-            updateState(props._id, { isRecording: true });
-            console.log('SyncWebview: Auto-started recording with stable rrweb version');
+        // Initialize replay service with webview as target
+        if (replayServiceRef.current && !replayServiceRef.current.getIsReplaying()) {
+          await replayServiceRef.current.initialize(webviewRef.current!);
+          
+          // Request snapshot from other clients if this is a late joiner
+          if (webSocketServiceRef.current && webSocketServiceRef.current.getIsInitialized()) {
+            await webSocketServiceRef.current.requestSnapshot();
           }
-        }, 1000); // 1 second delay
+          
+          // Start replaying
+          await replayServiceRef.current.startReplaying();
+          updateState(props._id, { isReplaying: true });
+        }
+
+        // Start recording automatically when webview is ready
+        if (!recorderServiceRef.current.getIsRecording()) {
+          // Add a small delay to ensure webview is fully loaded
+          setTimeout(() => {
+            if (recorderServiceRef.current && !recorderServiceRef.current.getIsRecording()) {
+              recorderServiceRef.current.startRecording({
+                maskInputOptions: {
+                  password: s.privacy.maskPasswords,
+                },
+              });
+              setRecordingError(null);
+              // Update state to reflect that recording has started
+              updateState(props._id, { isRecording: true });
+              console.log('SyncWebview: Auto-started recording and replay');
+            }
+          }, 1000); // 1 second delay
+        }
       } catch (error) {
-        console.error('SyncWebview: Failed to auto-start recording:', error);
-        setRecordingError('Failed to start recording');
-        updateState(props._id, { isRecording: false });
+        console.error('SyncWebview: Failed to initialize recording and replay:', error);
+        setRecordingError('Failed to start recording and replay');
+        updateState(props._id, { isRecording: false, isReplaying: false });
       }
-    }
+    };
+
+    initializeRecordingAndReplay();
   }, [domReady, attached, s.privacy.maskPasswords, props._id, updateState]);
 
 
@@ -347,26 +403,137 @@ function AppComponent(props: App): JSX.Element {
     }
   }, []);
 
-  const broadcastEvent = useCallback((event: SyncWebviewEvent) => {
-    // TODO: Integrate with SAGE3 WebSocket system
-    // For now, just log the event
-    console.log('SyncWebview: Broadcasting event:', event);
+  // WebSocket event handlers
+  const handleEventReceived = useCallback((event: SyncWebviewEvent) => {
+    console.log('SyncWebview: Received event from other client:', event);
+    
+    // Add event to replay service
+    if (replayServiceRef.current && replayServiceRef.current.getIsReplaying()) {
+      replayServiceRef.current.addEvent(event);
+    }
     
     // Update last event timestamp
     updateState(props._id, { lastEventTimestamp: event.timestamp });
   }, [props._id, updateState]);
 
-  const broadcastMouseBatch = useCallback((mouseBatch: any) => {
-    // TODO: Integrate with SAGE3 WebSocket system for mouse events
-    console.log('SyncWebview: Broadcasting optimized mouse batch:', mouseBatch);
+  const handleSnapshotReceived = useCallback((snapshot: string, timestamp: number) => {
+    console.log('SyncWebview: Received snapshot from other client');
+    
+    // Apply snapshot to replay service
+    if (replayServiceRef.current && replayServiceRef.current.getIsReplaying()) {
+      replayServiceRef.current.applySnapshot(snapshot, timestamp);
+    }
+    
+    // Update last event timestamp
+    updateState(props._id, { lastEventTimestamp: timestamp });
+  }, [props._id, updateState]);
+
+  const handleMouseBatchReceived = useCallback((batch: MouseMovementBatch) => {
+    console.log('SyncWebview: Received mouse batch from other client:', batch);
+    
+    // Handle mouse batch in replay service
+    if (replayServiceRef.current && replayServiceRef.current.getIsReplaying()) {
+      replayServiceRef.current.handleMouseBatch(batch);
+    }
+    
+    // Update last event timestamp
+    updateState(props._id, { lastEventTimestamp: batch.endTime });
+  }, [props._id, updateState]);
+
+  const handleMouseInteractionReceived = useCallback((interaction: MouseInteractionState) => {
+    console.log('SyncWebview: Received mouse interaction from other client:', interaction);
+    
+    // Handle mouse interaction in replay service
+    if (replayServiceRef.current && replayServiceRef.current.getIsReplaying()) {
+      replayServiceRef.current.handleMouseInteraction(interaction);
+    }
+    
+    // Update last event timestamp
+    updateState(props._id, { lastEventTimestamp: interaction.timestamp });
+  }, [props._id, updateState]);
+
+  const handleWebSocketError = useCallback((error: Error) => {
+    console.error('SyncWebview: WebSocket error:', error);
+    setConnectionStatus('disconnected');
+    toast({
+      title: 'Connection Error',
+      description: 'Lost connection to other clients',
+      status: 'error',
+      duration: 3000,
+    });
+  }, [toast]);
+
+  const handleReplayError = useCallback((error: Error) => {
+    console.error('SyncWebview: Replay error:', error);
+    toast({
+      title: 'Replay Error',
+      description: 'Error replaying events from other clients',
+      status: 'warning',
+      duration: 3000,
+    });
+  }, [toast]);
+
+  const handleReplayComplete = useCallback(() => {
+    console.log('SyncWebview: Replay completed');
+  }, []);
+
+  const handleSnapshotRequested = useCallback(async (requesterId: string) => {
+    console.log('SyncWebview: Snapshot requested by:', requesterId);
+    
+    // Generate snapshot using recorder service
+    if (recorderServiceRef.current && recorderServiceRef.current.getIsRecording()) {
+      try {
+        // This would need to be implemented in EventRecorderService
+        // For now, we'll create a placeholder snapshot
+        const snapshot = JSON.stringify({
+          type: 'snapshot',
+          timestamp: Date.now(),
+          url: s.url,
+          zoom: s.zoom
+        });
+        
+        // Send snapshot via WebSocket service
+        if (webSocketServiceRef.current && webSocketServiceRef.current.getIsInitialized()) {
+          await webSocketServiceRef.current.broadcastSnapshot(snapshot);
+          console.log('SyncWebview: Sent snapshot to requester');
+        }
+      } catch (error) {
+        console.error('SyncWebview: Failed to generate snapshot:', error);
+      }
+    }
+  }, [s.url, s.zoom]);
+
+  const broadcastEvent = useCallback((event: SyncWebviewEvent) => {
+    // Broadcast through WebSocket service
+    if (webSocketServiceRef.current && webSocketServiceRef.current.getIsInitialized()) {
+      webSocketServiceRef.current.broadcastEvent(event);
+    } else {
+      console.warn('SyncWebview: WebSocket service not available for broadcasting');
+    }
+    
+    // Update last event timestamp
+    updateState(props._id, { lastEventTimestamp: event.timestamp });
+  }, [props._id, updateState]);
+
+  const broadcastMouseBatch = useCallback((mouseBatch: MouseMovementBatch) => {
+    // Broadcast through WebSocket service
+    if (webSocketServiceRef.current && webSocketServiceRef.current.getIsInitialized()) {
+      webSocketServiceRef.current.broadcastMouseBatch(mouseBatch);
+    } else {
+      console.warn('SyncWebview: WebSocket service not available for mouse batch broadcasting');
+    }
     
     // Update last event timestamp for UI feedback
     updateState(props._id, { lastEventTimestamp: Date.now() });
   }, [props._id, updateState]);
 
-  const broadcastMouseInteraction = useCallback((interaction: any) => {
-    // TODO: Integrate with SAGE3 WebSocket system for mouse interactions
-    console.log('SyncWebview: Broadcasting mouse interaction:', interaction);
+  const broadcastMouseInteraction = useCallback((interaction: MouseInteractionState) => {
+    // Broadcast through WebSocket service
+    if (webSocketServiceRef.current && webSocketServiceRef.current.getIsInitialized()) {
+      webSocketServiceRef.current.broadcastMouseInteraction(interaction);
+    } else {
+      console.warn('SyncWebview: WebSocket service not available for mouse interaction broadcasting');
+    }
     
     // Update last event timestamp for UI feedback
     updateState(props._id, { lastEventTimestamp: Date.now() });
@@ -400,14 +567,23 @@ function AppComponent(props: App): JSX.Element {
                     <Text fontSize="sm" color="red.500">Error: {recordingError}</Text>
                   </HStack>
                 )}
-                {!recordingError && isRecording && (
+                {!recordingError && connectionStatus === 'connected' && isRecording && (
                   <HStack>
                     <MdSync color="green" />
                     <Text fontSize="sm" color="green.500">Active</Text>
                   </HStack>
                 )}
-                {!recordingError && !isRecording && (
-                  <Text fontSize="sm" color="gray.500">Inactive</Text>
+                {!recordingError && connectionStatus === 'connecting' && (
+                  <HStack>
+                    <MdSync color="orange" />
+                    <Text fontSize="sm" color="orange.500">Connecting</Text>
+                  </HStack>
+                )}
+                {!recordingError && connectionStatus === 'disconnected' && (
+                  <Text fontSize="sm" color="red.500">Disconnected</Text>
+                )}
+                {!recordingError && connectionStatus === 'connected' && !isRecording && (
+                  <Text fontSize="sm" color="gray.500">Ready</Text>
                 )}
               </HStack>
               <HStack spacing={4}>

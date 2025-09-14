@@ -22,7 +22,7 @@ export interface SyncWebviewEvent {
 
 // WebSocket message format for SAGE3 communication
 export interface SyncWebviewWebSocketMessage {
-  type: 'syncwebview-event' | 'syncwebview-snapshot' | 'syncwebview-request-snapshot';
+  type: 'syncwebview-event' | 'syncwebview-snapshot' | 'syncwebview-request-snapshot' | 'syncwebview-mouse-batch' | 'syncwebview-mouse-interaction';
   appId: string;
   data: any; // rrweb event data or DOM snapshot
   timestamp: number;

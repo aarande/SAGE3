@@ -23,6 +23,10 @@ export const schema = z.object({
     maskPasswords: z.boolean().default(true),
     maskElements: z.array(z.string()).default([]),
   }).default({}),
+  lastSyncMessage: z.object({
+    syncwebviewMessage: z.any(),
+    timestamp: z.number(),
+  }).optional(),
 });
 
 export type state = z.infer<typeof schema>;
