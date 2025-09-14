@@ -6,7 +6,7 @@
  * the file LICENSE, distributed as part of this software.
  */
 
-import { WorkerMessage, SyncWebviewEvent, MouseMovementBatch, PerformanceMetrics } from '../types';
+import { WorkerMessage, SyncWebviewEvent, MouseMovementBatch, PerformanceMetrics, MouseInteractionState } from '../types';
 
 /**
  * Service to manage the Event Processor Web Worker
@@ -106,6 +106,42 @@ export class WorkerManagerService {
   }
 
   /**
+   * Send mouse batch to worker for processing
+   */
+  public processMouseBatch(batch: MouseMovementBatch): void {
+    if (!this.worker || !this.isInitialized) {
+      console.warn('WorkerManagerService: Worker not initialized');
+      return;
+    }
+
+    const message: WorkerMessage = {
+      type: 'mouse-batch',
+      payload: batch,
+      timestamp: Date.now(),
+    };
+
+    this.worker.postMessage(message);
+  }
+
+  /**
+   * Send mouse interaction to worker for processing
+   */
+  public processMouseInteraction(interaction: MouseInteractionState): void {
+    if (!this.worker || !this.isInitialized) {
+      console.warn('WorkerManagerService: Worker not initialized');
+      return;
+    }
+
+    const message: WorkerMessage = {
+      type: 'mouse-interaction',
+      payload: interaction,
+      timestamp: Date.now(),
+    };
+
+    this.worker.postMessage(message);
+  }
+
+  /**
    * Send snapshot to worker for processing
    */
   public processSnapshot(snapshot: any): void {
@@ -184,6 +220,12 @@ export class WorkerManagerService {
         case 'snapshot':
           this.handleSnapshotResponse(payload);
           break;
+        case 'mouse-batch':
+          this.handleMouseBatchResponse(payload);
+          break;
+        case 'mouse-interaction':
+          this.handleMouseInteractionResponse(payload);
+          break;
         case 'error':
           this.errorCallback(payload);
           break;
@@ -217,6 +259,22 @@ export class WorkerManagerService {
   private handleSnapshotResponse(payload: any): void {
     console.log('WorkerManagerService: Received processed snapshot from worker');
     // Handle the processed snapshot
+  }
+
+  /**
+   * Handle mouse batch response from worker
+   */
+  private handleMouseBatchResponse(payload: any): void {
+    console.log('WorkerManagerService: Received optimized mouse batch from worker:', payload);
+    this.batchCallback(payload);
+  }
+
+  /**
+   * Handle mouse interaction response from worker
+   */
+  private handleMouseInteractionResponse(payload: any): void {
+    console.log('WorkerManagerService: Received processed mouse interaction from worker:', payload);
+    // Handle the processed mouse interaction
   }
 
   /**
@@ -320,6 +378,12 @@ export class WorkerManagerService {
               case 'config':
                 this.updateConfig(message.payload);
                 break;
+              case 'mouse-batch':
+                this.handleMouseBatch(message.payload);
+                break;
+              case 'mouse-interaction':
+                this.handleMouseInteraction(message.payload);
+                break;
               default:
                 console.warn('EventProcessor: Unknown message type:', message.type);
             }
@@ -367,6 +431,25 @@ export class WorkerManagerService {
           this.postMessage({
             type: 'snapshot',
             payload: compressedSnapshot,
+            timestamp: Date.now(),
+          });
+        }
+
+        handleMouseBatch(batch) {
+          // Process mouse batch with additional optimization
+          const optimizedBatch = this.optimizeMouseBatch(batch);
+          this.postMessage({
+            type: 'mouse-batch',
+            payload: optimizedBatch,
+            timestamp: Date.now(),
+          });
+        }
+
+        handleMouseInteraction(interaction) {
+          // Process mouse interaction state
+          this.postMessage({
+            type: 'mouse-interaction',
+            payload: interaction,
             timestamp: Date.now(),
           });
         }
@@ -553,6 +636,50 @@ export class WorkerManagerService {
           }
 
           return validMeasurements > 0 ? totalVelocity / validMeasurements : 0;
+        }
+
+        optimizeMouseBatch(batch) {
+          // Additional optimization for mouse batches from MouseOptimizationService
+          const events = batch.events || [];
+          
+          if (events.length <= 2) return batch;
+
+          // Apply additional compression based on current performance
+          const compressionRatio = this.getCompressionRatio();
+          const targetEventCount = Math.max(2, Math.floor(events.length * compressionRatio));
+          
+          if (events.length <= targetEventCount) return batch;
+
+          // Keep first and last events, sample the middle ones
+          const optimizedEvents = [events[0]];
+          const step = Math.max(1, Math.floor((events.length - 2) / (targetEventCount - 2)));
+          
+          for (let i = step; i < events.length - 1; i += step) {
+            optimizedEvents.push(events[i]);
+          }
+          
+          optimizedEvents.push(events[events.length - 1]);
+
+          return {
+            ...batch,
+            events: optimizedEvents,
+            originalEventCount: events.length,
+            optimizedEventCount: optimizedEvents.length,
+            compressionRatio: compressionRatio,
+          };
+        }
+
+        getCompressionRatio() {
+          // Adjust compression based on performance metrics
+          const { clientPerformance, eventQueueSize, networkLatency } = this.performanceMetrics;
+          
+          if (clientPerformance === 'low' || eventQueueSize > 500 || networkLatency > 200) {
+            return 0.3; // Aggressive compression
+          } else if (clientPerformance === 'medium' || eventQueueSize > 200 || networkLatency > 100) {
+            return 0.6; // Moderate compression
+          } else {
+            return 0.8; // Light compression
+          }
         }
 
         compressSnapshot(snapshot) {

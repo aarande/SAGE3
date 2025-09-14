@@ -104,7 +104,7 @@ export interface ReplayerConfig {
 
 // Web Worker message types
 export interface WorkerMessage {
-  type: 'event' | 'batch' | 'snapshot' | 'config' | 'error';
+  type: 'event' | 'batch' | 'snapshot' | 'config' | 'error' | 'mouse-batch' | 'mouse-interaction';
   payload: any;
   timestamp: number;
 }
@@ -123,6 +123,9 @@ export interface WorkerPerformanceMetrics extends PerformanceMetrics {
   batchInterval: number; // Current batch processing interval
 }
 
+// Mouse optimization strategies for different element types
+export type MouseStrategy = 'high-fidelity' | 'drag-optimized' | 'media-optimized' | 'standard';
+
 // Application event types for internal communication
 export type SyncWebviewAppEvent =
   | { type: 'START_RECORDING'; payload: { url: string } }
@@ -134,4 +137,6 @@ export type SyncWebviewAppEvent =
   | { type: 'PRIVACY_UPDATED'; payload: { maskPasswords: boolean; maskElements: string[] } }
   | { type: 'EVENT_RECEIVED'; payload: SyncWebviewEvent }
   | { type: 'SNAPSHOT_REQUESTED' }
-  | { type: 'SNAPSHOT_RECEIVED'; payload: { snapshot: string; timestamp: number } };
+  | { type: 'SNAPSHOT_RECEIVED'; payload: { snapshot: string; timestamp: number } }
+  | { type: 'MOUSE_BATCH_RECEIVED'; payload: MouseMovementBatch }
+  | { type: 'MOUSE_INTERACTION_RECEIVED'; payload: MouseInteractionState };

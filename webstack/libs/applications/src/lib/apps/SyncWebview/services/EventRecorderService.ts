@@ -8,7 +8,8 @@
 
 import { record } from 'rrweb';
 import type { eventWithTime, listenerHandler } from 'rrweb/typings/types';
-import { SyncWebviewEvent, RecorderConfig, MouseEventContext, MouseMoveEvent } from '../types';
+import { SyncWebviewEvent, RecorderConfig, MouseEventContext, MouseMoveEvent, MouseMovementBatch, MouseInteractionState } from '../types';
+import { MouseOptimizationService } from './MouseOptimizationService';
 
 /**
  * Event Recorder Service using rrweb
@@ -18,27 +19,25 @@ export class EventRecorderService {
   private recorder: listenerHandler | null = null;
   private isRecording = false;
   private eventBuffer: eventWithTime[] = [];
-  private mouseContext: MouseEventContext = {
-    isInteracting: false,
-    interactionType: 'none',
-    lastSignificantMove: 0,
-    velocity: 0,
-    element: null,
-  };
-  private lastMousePosition = { x: 0, y: 0, timestamp: 0 };
-  private mouseSamplingRate = 500; // Default 2fps for mouse movements
+  private mouseOptimizationService: MouseOptimizationService | null = null;
   private eventCallback: (event: SyncWebviewEvent) => void;
+  private mouseBatchCallback: (batch: MouseMovementBatch) => void;
+  private mouseInteractionCallback: (state: MouseInteractionState) => void;
   private userId: string;
   private sessionId: string;
 
   constructor(
     eventCallback: (event: SyncWebviewEvent) => void,
     userId: string,
-    sessionId: string
+    sessionId: string,
+    mouseBatchCallback?: (batch: MouseMovementBatch) => void,
+    mouseInteractionCallback?: (state: MouseInteractionState) => void
   ) {
     this.eventCallback = eventCallback;
     this.userId = userId;
     this.sessionId = sessionId;
+    this.mouseBatchCallback = mouseBatchCallback || (() => {});
+    this.mouseInteractionCallback = mouseInteractionCallback || (() => {});
   }
 
   /**
@@ -53,11 +52,17 @@ export class EventRecorderService {
     const recordingConfig = this.buildRecordingConfig(config);
     
     try {
+      // Initialize mouse optimization service
+      this.mouseOptimizationService = new MouseOptimizationService(
+        this.handleMouseBatch.bind(this),
+        this.handleMouseInteraction.bind(this)
+      );
+
       const stopFn = record(recordingConfig);
       if (stopFn) {
         this.recorder = stopFn;
         this.isRecording = true;
-        console.log('EventRecorderService: Recording started');
+        console.log('EventRecorderService: Recording started with intelligent mouse optimization');
       } else {
         throw new Error('Failed to initialize rrweb recorder');
       }
@@ -81,6 +86,13 @@ export class EventRecorderService {
       this.recorder = null;
       this.isRecording = false;
       this.eventBuffer = [];
+      
+      // Cleanup mouse optimization service
+      if (this.mouseOptimizationService) {
+        this.mouseOptimizationService.destroy();
+        this.mouseOptimizationService = null;
+      }
+      
       console.log('EventRecorderService: Recording stopped');
     } catch (error) {
       console.error('EventRecorderService: Error stopping recording:', error);
@@ -158,6 +170,11 @@ export class EventRecorderService {
     if (!this.isRecording) return;
 
     try {
+      // Skip mouse move events as they're handled by MouseOptimizationService
+      if (this.isMouseMoveEvent(event)) {
+        return;
+      }
+
       // Create SyncWebview event wrapper
       const syncEvent: SyncWebviewEvent = {
         id: this.generateEventId(),
@@ -185,164 +202,72 @@ export class EventRecorderService {
   }
 
   /**
-   * Create smart mouse movement plugin for rrweb
+   * Handle optimized mouse movement batches
    */
-  private createSmartMousePlugin(): any {
-    return {
-      name: 'smart-mouse',
-      observer: (cb: Function) => {
-        const handleMouseMove = (event: MouseEvent) => {
-          if (!this.shouldRecordMouseMove(event)) return;
+  private handleMouseBatch(batch: MouseMovementBatch): void {
+    if (!this.isRecording) return;
 
-          const mouseEvent = {
-            type: 3, // MouseMove event type in rrweb
-            data: {
-              source: 2, // MouseInteraction source
-              type: 0, // MouseMove type
-              id: this.getElementId(event.target as Element),
-              x: event.clientX,
-              y: event.clientY,
-            },
-            timestamp: Date.now(),
-          };
+    try {
+      // Convert mouse batch to SyncWebview event
+      const syncEvent: SyncWebviewEvent = {
+        id: this.generateEventId(),
+        timestamp: batch.startTime,
+        type: 'rrweb',
+        data: {
+          type: 'mouse-batch',
+          batch: batch,
+        },
+        userId: this.userId,
+        sessionId: this.sessionId,
+      };
 
-          cb(mouseEvent);
-          this.updateMouseContext(event);
-        };
-
-        const handleMouseDown = (event: MouseEvent) => {
-          this.mouseContext.isInteracting = true;
-          this.mouseContext.interactionType = 'drag';
-          this.mouseSamplingRate = 16; // 60fps during interactions
-        };
-
-        const handleMouseUp = (event: MouseEvent) => {
-          this.mouseContext.isInteracting = false;
-          this.mouseContext.interactionType = 'none';
-          this.mouseSamplingRate = 500; // Back to 2fps
-        };
-
-        // Add event listeners
-        document.addEventListener('mousemove', handleMouseMove, { passive: true });
-        document.addEventListener('mousedown', handleMouseDown, { passive: true });
-        document.addEventListener('mouseup', handleMouseUp, { passive: true });
-
-        // Return cleanup function
-        return () => {
-          document.removeEventListener('mousemove', handleMouseMove);
-          document.removeEventListener('mousedown', handleMouseDown);
-          document.removeEventListener('mouseup', handleMouseUp);
-        };
-      },
-    };
+      this.mouseBatchCallback(batch);
+      console.log('EventRecorderService: Processed optimized mouse batch with', batch.events.length, 'events');
+    } catch (error) {
+      console.warn('EventRecorderService: Error handling mouse batch:', error);
+    }
   }
 
   /**
-   * Determine if mouse movement should be recorded based on context
+   * Handle mouse interaction state changes
    */
-  private shouldRecordMouseMove(event: MouseEvent): boolean {
-    const now = Date.now();
-    const timeSinceLastMove = now - this.lastMousePosition.timestamp;
+  private handleMouseInteraction(state: MouseInteractionState): void {
+    if (!this.isRecording) return;
 
-    // Always record if we're in an interaction
-    if (this.mouseContext.isInteracting) {
-      return timeSinceLastMove >= this.mouseSamplingRate;
+    try {
+      // Convert interaction state to SyncWebview event
+      const syncEvent: SyncWebviewEvent = {
+        id: this.generateEventId(),
+        timestamp: state.timestamp,
+        type: 'rrweb',
+        data: {
+          type: 'mouse-interaction',
+          state: state,
+        },
+        userId: this.userId,
+        sessionId: this.sessionId,
+      };
+
+      this.mouseInteractionCallback(state);
+      console.log('EventRecorderService: Processed mouse interaction:', state.type);
+    } catch (error) {
+      console.warn('EventRecorderService: Error handling mouse interaction:', error);
     }
-
-    // Check if mouse moved significantly
-    const distance = Math.sqrt(
-      Math.pow(event.clientX - this.lastMousePosition.x, 2) +
-      Math.pow(event.clientY - this.lastMousePosition.y, 2)
-    );
-
-    // Only record if moved more than 5px and enough time has passed
-    if (distance < 5 || timeSinceLastMove < this.mouseSamplingRate) {
-      return false;
-    }
-
-    // Check if over interactive element
-    const target = event.target as Element;
-    if (target && this.isInteractiveElement(target)) {
-      return timeSinceLastMove >= 100; // 10fps for interactive elements
-    }
-
-    return timeSinceLastMove >= this.mouseSamplingRate;
   }
 
   /**
-   * Update mouse movement context
+   * Check if event is a mouse move event
    */
-  private updateMouseContext(event: MouseEvent): void {
-    const now = Date.now();
-    const timeDelta = now - this.lastMousePosition.timestamp;
-    
-    if (timeDelta > 0) {
-      const distance = Math.sqrt(
-        Math.pow(event.clientX - this.lastMousePosition.x, 2) +
-        Math.pow(event.clientY - this.lastMousePosition.y, 2)
-      );
-      this.mouseContext.velocity = distance / timeDelta;
-    }
-
-    this.mouseContext.element = event.target as HTMLElement;
-    this.mouseContext.lastSignificantMove = now;
-    
-    this.lastMousePosition = {
-      x: event.clientX,
-      y: event.clientY,
-      timestamp: now,
-    };
-  }
-
-  /**
-   * Check if element is interactive
-   */
-  private isInteractiveElement(element: Element): boolean {
-    const interactiveTags = ['button', 'a', 'input', 'select', 'textarea', 'label'];
-    const tagName = element.tagName.toLowerCase();
-    
+  private isMouseMoveEvent(event: eventWithTime): boolean {
     return (
-      interactiveTags.includes(tagName) ||
-      element.hasAttribute('onclick') ||
-      element.hasAttribute('onmousedown') ||
-      element.classList.contains('clickable') ||
-      element.classList.contains('interactive') ||
-      window.getComputedStyle(element).cursor === 'pointer'
+      event.type === 3 && // MouseInteraction event type
+      event.data &&
+      event.data.source === 2 && // MouseInteraction source
+      event.data.type === 0 // MouseMove type
     );
   }
 
-  /**
-   * Get unique identifier for DOM element
-   */
-  private getElementId(element: Element | null): number {
-    if (!element) return 0;
-    
-    // Use existing id if available
-    if (element.id) {
-      return this.hashString(element.id);
-    }
-    
-    // Generate based on tag name and position
-    const tagName = element.tagName.toLowerCase();
-    const parent = element.parentElement;
-    const siblings = parent ? Array.from(parent.children) : [];
-    const index = siblings.indexOf(element);
-    
-    return this.hashString(`${tagName}-${index}-${parent?.tagName || 'root'}`);
-  }
 
-  /**
-   * Simple string hash function
-   */
-  private hashString(str: string): number {
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) {
-      const char = str.charCodeAt(i);
-      hash = ((hash << 5) - hash) + char;
-      hash = hash & hash; // Convert to 32-bit integer
-    }
-    return Math.abs(hash);
-  }
 
   /**
    * Generate unique event ID
@@ -357,6 +282,31 @@ export class EventRecorderService {
   public updatePrivacySettings(maskPasswords: boolean, maskElements: string[]): void {
     // Privacy settings will be applied on next recording session
     console.log('EventRecorderService: Privacy settings updated', { maskPasswords, maskElements });
+  }
+
+  /**
+   * Update performance metrics for mouse optimization
+   */
+  public updatePerformanceMetrics(metrics: any): void {
+    if (this.mouseOptimizationService) {
+      this.mouseOptimizationService.updatePerformanceMetrics(metrics);
+    }
+  }
+
+  /**
+   * Get current mouse context from optimization service
+   */
+  public getMouseContext(): MouseEventContext | null {
+    return this.mouseOptimizationService ? this.mouseOptimizationService.getMouseContext() : null;
+  }
+
+  /**
+   * Flush any pending mouse events
+   */
+  public flushMouseBuffer(): void {
+    if (this.mouseOptimizationService) {
+      this.mouseOptimizationService.flushMouseBuffer();
+    }
   }
 
   /**

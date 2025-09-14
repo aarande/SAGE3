@@ -115,11 +115,13 @@ function AppComponent(props: App): JSX.Element {
         await workerManager.initialize();
         workerManagerRef.current = workerManager;
 
-        // Initialize Event Recorder
+        // Initialize Event Recorder with mouse optimization callbacks
         const recorder = new EventRecorderService(
           handleRecordedEvent,
           user?.data.name || 'anonymous',
-          props._id // Use app ID as session ID
+          props._id, // Use app ID as session ID
+          handleMouseBatch,
+          handleMouseInteraction
         );
         recorderServiceRef.current = recorder;
 
@@ -313,6 +315,38 @@ function AppComponent(props: App): JSX.Element {
     });
   }, [toast]);
 
+  const handleMouseBatch = useCallback((batch: any) => {
+    // Handle optimized mouse movement batches
+    console.log('SyncWebview: Received optimized mouse batch:', batch);
+    
+    // Process through worker if available
+    if (workerManagerRef.current && workerManagerRef.current.getIsInitialized()) {
+      workerManagerRef.current.processBatch(batch.events);
+    } else {
+      // Fallback to direct broadcasting
+      broadcastMouseBatch(batch);
+    }
+  }, []);
+
+  const handleMouseInteraction = useCallback((state: any) => {
+    // Handle mouse interaction state changes
+    console.log('SyncWebview: Mouse interaction state changed:', state);
+    
+    // Broadcast interaction state immediately for real-time feedback
+    broadcastMouseInteraction(state);
+    
+    // Update performance metrics if recorder is available
+    if (recorderServiceRef.current) {
+      const performanceMetrics = {
+        eventQueueSize: 0, // Will be updated by worker
+        networkLatency: 0, // Will be updated by worker
+        processingDelay: 0,
+        clientPerformance: 'medium' as const,
+      };
+      recorderServiceRef.current.updatePerformanceMetrics(performanceMetrics);
+    }
+  }, []);
+
   const broadcastEvent = useCallback((event: SyncWebviewEvent) => {
     // TODO: Integrate with SAGE3 WebSocket system
     // For now, just log the event
@@ -324,8 +358,19 @@ function AppComponent(props: App): JSX.Element {
 
   const broadcastMouseBatch = useCallback((mouseBatch: any) => {
     // TODO: Integrate with SAGE3 WebSocket system for mouse events
-    console.log('SyncWebview: Broadcasting mouse batch:', mouseBatch);
-  }, []);
+    console.log('SyncWebview: Broadcasting optimized mouse batch:', mouseBatch);
+    
+    // Update last event timestamp for UI feedback
+    updateState(props._id, { lastEventTimestamp: Date.now() });
+  }, [props._id, updateState]);
+
+  const broadcastMouseInteraction = useCallback((interaction: any) => {
+    // TODO: Integrate with SAGE3 WebSocket system for mouse interactions
+    console.log('SyncWebview: Broadcasting mouse interaction:', interaction);
+    
+    // Update last event timestamp for UI feedback
+    updateState(props._id, { lastEventTimestamp: Date.now() });
+  }, [props._id, updateState]);
 
   // Window resize hook
   const isFocused = useUIStore((state) => state.focusedAppId === props._id);
