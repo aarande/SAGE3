@@ -6,8 +6,8 @@
  * the file LICENSE, distributed as part of this software.
  */
 
-import { WorkerManagerService } from '../services/WorkerManagerService';
-import { SyncWebviewEvent, WorkerMessage } from '../types';
+import { WorkerManagerService } from '../../services/WorkerManagerService';
+import { SyncWebviewEvent, WorkerMessage } from '../../types';
 
 describe('EventProcessorWorker', () => {
   let workerManager: WorkerManagerService;

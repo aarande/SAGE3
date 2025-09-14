@@ -12,7 +12,10 @@ import {
     SyncWebviewWebSocketMessage,
     MouseMovementBatch,
     MouseInteractionState,
-    PerformanceMetrics
+    PerformanceMetrics,
+    CompressedSnapshot,
+    SnapshotRequest,
+    NavigationEvent
 } from '../types';
 
 /**
@@ -38,11 +41,12 @@ export class WebSocketService {
         userId: string,
         boardId: string,
         private onEventReceived: (event: SyncWebviewEvent) => void,
-        private onSnapshotReceived: (snapshot: string, timestamp: number) => void,
+        private onSnapshotReceived: (snapshot: CompressedSnapshot) => void,
         private onMouseBatchReceived: (batch: MouseMovementBatch) => void,
         private onMouseInteractionReceived: (interaction: MouseInteractionState) => void,
         private onError: (error: Error) => void,
-        private onSnapshotRequested?: (requesterId: string) => void
+        private onSnapshotRequested?: (request: SnapshotRequest) => void,
+        private onNavigationReceived?: (navigation: NavigationEvent) => void
     ) {
         this.appId = appId;
         this.userId = userId;
@@ -117,7 +121,7 @@ export class WebSocketService {
                     break;
 
                 case 'syncwebview-snapshot':
-                    this.onSnapshotReceived(message.data.snapshot, message.data.timestamp);
+                    this.onSnapshotReceived(message.data as CompressedSnapshot);
                     break;
 
                 case 'syncwebview-request-snapshot':
@@ -130,6 +134,12 @@ export class WebSocketService {
 
                 case 'syncwebview-mouse-interaction':
                     this.onMouseInteractionReceived(message.data as MouseInteractionState);
+                    break;
+
+                case 'syncwebview-navigation':
+                    if (this.onNavigationReceived) {
+                        this.onNavigationReceived(message.data as NavigationEvent);
+                    }
                     break;
 
                 default:
@@ -152,9 +162,16 @@ export class WebSocketService {
     private handleSnapshotRequest(message: SyncWebviewWebSocketMessage): void {
         console.log('SyncWebview: Snapshot requested by:', message.userId);
 
+        // Create snapshot request object
+        const request: SnapshotRequest = {
+            requesterId: message.userId,
+            timestamp: message.timestamp,
+            url: message.data?.url
+        };
+
         // Trigger snapshot generation callback
         if (this.onSnapshotRequested) {
-            this.onSnapshotRequested(message.userId);
+            this.onSnapshotRequested(request);
         }
     }
 
@@ -239,7 +256,7 @@ export class WebSocketService {
     /**
      * Broadcast a DOM snapshot to all other clients
      */
-    async broadcastSnapshot(snapshot: string): Promise<void> {
+    async broadcastSnapshot(snapshot: CompressedSnapshot): Promise<void> {
         if (!this.isInitialized) {
             console.warn('SyncWebview: WebSocket service not initialized');
             return;
@@ -249,10 +266,7 @@ export class WebSocketService {
             const message: SyncWebviewWebSocketMessage = {
                 type: 'syncwebview-snapshot',
                 appId: this.appId,
-                data: {
-                    snapshot,
-                    timestamp: Date.now()
-                },
+                data: snapshot,
                 timestamp: Date.now(),
                 userId: this.userId
             };
@@ -268,17 +282,23 @@ export class WebSocketService {
     /**
      * Request a snapshot from other clients
      */
-    async requestSnapshot(): Promise<void> {
+    async requestSnapshot(url?: string): Promise<void> {
         if (!this.isInitialized) {
             console.warn('SyncWebview: WebSocket service not initialized');
             return;
         }
 
         try {
+            const request: SnapshotRequest = {
+                requesterId: this.userId,
+                timestamp: Date.now(),
+                url
+            };
+
             const message: SyncWebviewWebSocketMessage = {
                 type: 'syncwebview-request-snapshot',
                 appId: this.appId,
-                data: {},
+                data: request,
                 timestamp: Date.now(),
                 userId: this.userId
             };
@@ -288,6 +308,32 @@ export class WebSocketService {
         } catch (error) {
             console.error('SyncWebview: Failed to request snapshot:', error);
             this.onError(new Error('Failed to request snapshot'));
+        }
+    }
+
+    /**
+     * Broadcast a navigation event to all other clients
+     */
+    async broadcastNavigation(navigation: NavigationEvent): Promise<void> {
+        if (!this.isInitialized) {
+            console.warn('SyncWebview: WebSocket service not initialized');
+            return;
+        }
+
+        try {
+            const message: SyncWebviewWebSocketMessage = {
+                type: 'syncwebview-navigation',
+                appId: this.appId,
+                data: navigation,
+                timestamp: Date.now(),
+                userId: this.userId
+            };
+
+            await this.sendMessage(message);
+
+        } catch (error) {
+            console.error('SyncWebview: Failed to broadcast navigation:', error);
+            this.onError(new Error('Failed to broadcast navigation'));
         }
     }
 

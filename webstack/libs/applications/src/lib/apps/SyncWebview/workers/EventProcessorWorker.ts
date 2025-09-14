@@ -6,7 +6,8 @@
  * the file LICENSE, distributed as part of this software.
  */
 
-import type { eventWithTime } from '@rrweb/types';
+// rrweb types - using any for now since @rrweb/types may not be available
+// import type { eventWithTime } from '@rrweb/types';
 import { 
   WorkerMessage, 
   SyncWebviewEvent, 
@@ -79,9 +80,10 @@ class EventProcessor {
 
     } catch (error) {
       console.error('EventProcessor: Error processing event:', error);
+      const errorMessage = error instanceof Error ? error.message : String(error);
       this.postMessage({
         type: 'error',
-        payload: { error: error.message, timestamp: Date.now() },
+        payload: { error: errorMessage, timestamp: Date.now() },
         timestamp: Date.now(),
       });
     }
@@ -208,6 +210,17 @@ class EventProcessor {
       (eventType === 3 && interactionType === 7) || // Focus
       (eventType === 3 && interactionType === 8)    // Blur
     );
+  }
+
+  /**
+   * Send event immediately to main thread
+   */
+  private sendEvent(event: SyncWebviewEvent): void {
+    this.postMessage({
+      type: 'event',
+      payload: event,
+      timestamp: Date.now(),
+    });
   }
 
   /**
@@ -373,7 +386,8 @@ class EventProcessor {
       };
     } catch (error) {
       console.error('EventProcessor: Error compressing snapshot:', error);
-      return { data: null, error: error.message };
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return { data: null, error: errorMessage };
     }
   }
 
