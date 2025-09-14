@@ -116,7 +116,7 @@ function AppComponent(props: App): JSX.Element {
         // Initialize WebSocket Service first
         const webSocketService = new WebSocketService(
           props._id,
-          user?.data._id || 'anonymous',
+          user?._id || 'anonymous',
           boardId || 'unknown',
           handleEventReceived,
           handleSnapshotReceived,
@@ -187,7 +187,7 @@ function AppComponent(props: App): JSX.Element {
         replayServiceRef.current.stopReplaying();
       }
     };
-  }, [props._id, user?.data._id, user?.data.name, boardId, toast]);
+  }, [props._id, user?._id, user?.data.name, boardId, toast]);
 
   // Auto-start recording and replay when webview is ready
   useEffect(() => {
@@ -210,7 +210,7 @@ function AppComponent(props: App): JSX.Element {
         }
 
         // Start recording automatically when webview is ready
-        if (!recorderServiceRef.current.getIsRecording()) {
+        if (recorderServiceRef.current && !recorderServiceRef.current.getIsRecording()) {
           // Add a small delay to ensure webview is fully loaded
           setTimeout(() => {
             if (recorderServiceRef.current && !recorderServiceRef.current.getIsRecording()) {
