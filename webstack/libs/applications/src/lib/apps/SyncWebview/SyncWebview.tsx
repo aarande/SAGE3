@@ -40,8 +40,20 @@ import {
 import { useAppStore, useUser, processContentURL, useHexColor, useUIStore, useWindowResize } from '@sage3/frontend';
 import { App } from '../../schema';
 import { state as AppState } from './index';
-import { AppWindow } from '../../components';
+import { AppWindow, ElectronRequired } from '../../components';
 import { SyncWebviewEvent, SyncWebviewWebSocketMessage } from './types';
+
+// Electron webview type
+// @ts-ignore
+import { WebviewTag } from 'electron';
+
+/**
+ * Check if browser is Electron based on the userAgent.
+ * @returns {boolean}
+ */
+function isElectron(): boolean {
+  return typeof navigator === 'object' && typeof navigator.userAgent === 'string' && navigator.userAgent.includes('Electron');
+}
 
 /* App component for SyncWebview */
 
@@ -52,7 +64,7 @@ function AppComponent(props: App): JSX.Element {
   const updateState = useAppStore((state) => state.updateState);
 
   // Local State
-  const iframeRef = useRef<HTMLIFrameElement>(null);
+  const webviewRef = useRef<WebviewTag>();
   const [url, setUrl] = useState<string>(s.url);
   const [isRecording, setIsRecording] = useState<boolean>(s.isRecording);
   const [isReplaying, setIsReplaying] = useState<boolean>(s.isReplaying);
@@ -68,6 +80,10 @@ function AppComponent(props: App): JSX.Element {
   // Toast for notifications
   const toast = useToast();
 
+  // Tracking the dom-ready and did-load events
+  const [domReady, setDomReady] = useState(false);
+  const [attached, setAttached] = useState(false);
+
   // Update local state when app state changes
   useEffect(() => {
     setUrl(s.url);
@@ -76,11 +92,58 @@ function AppComponent(props: App): JSX.Element {
     setZoom(s.zoom);
   }, [s.url, s.isRecording, s.isReplaying, s.zoom]);
 
-  // Load URL in iframe
+  // Init the webview (Electron only)
+  const setWebviewRef = useCallback((node: WebviewTag) => {
+    // event did-attach callback
+    const didAttachCallback = (evt: any) => {
+      webviewRef.current?.removeEventListener('did-attach', didAttachCallback);
+      setAttached(true);
+    };
+
+    // event dom-ready callback
+    const domReadyCallback = (evt: any) => {
+      webviewRef.current?.removeEventListener('dom-ready', domReadyCallback);
+      setDomReady(true);
+    };
+
+    if (node) {
+      webviewRef.current = node;
+      const webview = webviewRef.current;
+
+      // Set partition for isolation
+      webview.partition = 'persist:syncwebview_' + props._id;
+
+      // Callback when the webview is ready
+      webview.addEventListener('dom-ready', domReadyCallback);
+      webview.addEventListener('did-attach', didAttachCallback);
+
+      const titleUpdated = (event: any) => {
+        // Update the app title
+        update(props._id, { title: event.title });
+      };
+      webview.addEventListener('page-title-updated', titleUpdated);
+
+      // After the partition has been set, you can navigate
+      webview.src = url;
+    }
+  }, [props._id, update, url]);
+
+  // Load URL in webview (Electron only)
   const loadURL = useCallback((newUrl: string) => {
-    if (iframeRef.current) {
+    if (domReady === false || attached === false) return;
+    if (webviewRef.current) {
       try {
-        iframeRef.current.src = newUrl;
+        webviewRef.current.stop();
+        webviewRef.current.loadURL(newUrl).catch((err: any) => {
+          console.log('SyncWebview> Error loading URL:', newUrl, err);
+          if (err.code === 'ERR_ABORTED') return;
+          toast({
+            title: 'Error loading URL',
+            description: 'Failed to load the specified URL',
+            status: 'error',
+            duration: 3000,
+          });
+        });
         setUrl(newUrl);
       } catch (error) {
         console.error('SyncWebview> Error loading URL:', newUrl, error);
@@ -92,22 +155,34 @@ function AppComponent(props: App): JSX.Element {
         });
       }
     }
-  }, [toast]);
+  }, [domReady, attached, toast]);
 
-  // Initialize iframe with URL
+  // Update to URL from backend
   useEffect(() => {
     if (s.url !== url) {
-      loadURL(s.url);
+      if (isElectron()) {
+        loadURL(s.url);
+      }
+      setUrl(s.url);
     }
-  }, [s.url, loadURL]);
+  }, [s.url, url, loadURL]);
+
+  // Set zoom when it changes
+  useEffect(() => {
+    if (domReady === false || attached === false) return;
+    if (webviewRef.current && s.zoom) {
+      setZoom(s.zoom);
+      webviewRef.current.setZoomFactor(s.zoom);
+    }
+  }, [s.zoom, domReady, attached]);
 
   // Window resize hook
   const isFocused = useUIStore((state) => state.focusedAppId === props._id);
   const { width: winWidth, height: winHeight } = useWindowResize();
 
-  const iframeStyle: React.CSSProperties = {
+  const webviewStyle: React.CSSProperties = {
     width: isFocused ? winWidth + 'px' : props.data.size.width + 'px',
-    height: isFocused ? winHeight - 40 + 'px' : props.data.size.height - 40 + 'px', // Account for toolbar
+    height: isFocused ? winHeight - 40 + 'px' : props.data.size.height - 40 + 'px', // Account for status bar
     border: 'none',
     background: 'white',
     visibility: boardDragging ? 'hidden' : 'visible',
@@ -115,47 +190,45 @@ function AppComponent(props: App): JSX.Element {
 
   return (
     <AppWindow app={props} hideBackgroundIcon={MdSync}>
-      <VStack spacing={0} height="100%">
-        {/* Status Bar */}
-        <Box width="100%" p={2} bg="gray.100" borderBottom="1px solid" borderColor="gray.200">
-          <HStack justify="space-between">
-            <HStack>
-              <Text fontSize="sm" color="gray.600">
-                Status:
+      {isElectron() ? (
+        <VStack spacing={0} height="100%">
+          {/* Status Bar */}
+          <Box width="100%" p={2} bg="gray.100" borderBottom="1px solid" borderColor="gray.200">
+            <HStack justify="space-between">
+              <HStack>
+                <Text fontSize="sm" color="gray.600">
+                  Status:
+                </Text>
+                {isRecording && (
+                  <HStack>
+                    <MdRadioButtonChecked color="red" />
+                    <Text fontSize="sm" color="red.500">Recording</Text>
+                  </HStack>
+                )}
+                {isReplaying && (
+                  <HStack>
+                    <MdPlayArrow color="green" />
+                    <Text fontSize="sm" color="green.500">Replaying</Text>
+                  </HStack>
+                )}
+                {!isRecording && !isReplaying && (
+                  <Text fontSize="sm" color="gray.500">Idle</Text>
+                )}
+              </HStack>
+              <Text fontSize="xs" color="gray.500">
+                Zoom: {Math.round(zoom * 100)}%
               </Text>
-              {isRecording && (
-                <HStack>
-                  <MdRadioButtonChecked color="red" />
-                  <Text fontSize="sm" color="red.500">Recording</Text>
-                </HStack>
-              )}
-              {isReplaying && (
-                <HStack>
-                  <MdPlayArrow color="green" />
-                  <Text fontSize="sm" color="green.500">Replaying</Text>
-                </HStack>
-              )}
-              {!isRecording && !isReplaying && (
-                <Text fontSize="sm" color="gray.500">Idle</Text>
-              )}
             </HStack>
-            <Text fontSize="xs" color="gray.500">
-              Zoom: {Math.round(zoom * 100)}%
-            </Text>
-          </HStack>
-        </Box>
+          </Box>
 
-        {/* Main Content Area */}
-        <Box flex={1} width="100%" position="relative">
-          <iframe
-            ref={iframeRef}
-            src={url}
-            style={iframeStyle}
-            title="SyncWebview Content"
-            sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox"
-          />
-        </Box>
-      </VStack>
+          {/* Main Content Area */}
+          <Box flex={1} width="100%" position="relative">
+            <webview ref={setWebviewRef} style={webviewStyle} allowpopups={'true' as any}></webview>
+          </Box>
+        </VStack>
+      ) : (
+        <ElectronRequired appName={props.data.type} link={s.url} title={props.data.title} />
+      )}
     </AppWindow>
   );
 }
@@ -174,6 +247,9 @@ function ToolbarComponent(props: App): JSX.Element {
 
   // Room and board info
   const { roomId } = useParams();
+
+  // Check if running in Electron
+  const clientIsElectron = isElectron();
 
   // Update local URL input when state changes
   useEffect(() => {
@@ -288,106 +364,128 @@ function ToolbarComponent(props: App): JSX.Element {
 
   // Open URL in new tab/window
   const openExternal = () => {
-    window.open(s.url, '_blank');
+    if (clientIsElectron) {
+      window.electron.send('open-external-url', { url: s.url });
+    } else {
+      window.open(s.url, '_blank');
+    }
   };
 
   return (
     <HStack spacing={2}>
-      {/* Navigation Controls */}
-      <ButtonGroup isAttached size="xs" colorScheme="teal">
-        <Tooltip label="Go Back" placement="top" hasArrow openDelay={400}>
-          <Button size="xs" px={2} isDisabled>
-            <MdArrowBack size="16px" />
-          </Button>
-        </Tooltip>
-        
-        <Tooltip label="Go Forward" placement="top" hasArrow openDelay={400}>
-          <Button size="xs" px={2} isDisabled>
-            <MdArrowForward size="16px" />
-          </Button>
-        </Tooltip>
-        
-        <Tooltip label="Refresh" placement="top" hasArrow openDelay={400}>
-          <Button size="xs" px={2} onClick={() => updateState(props._id, { url: s.url })}>
-            <MdRefresh size="16px" />
-          </Button>
-        </Tooltip>
-      </ButtonGroup>
+      {clientIsElectron ? (
+        <>
+          {/* Navigation Controls - Only in Electron */}
+          <ButtonGroup isAttached size="xs" colorScheme="teal">
+            <Tooltip label="Go Back" placement="top" hasArrow openDelay={400}>
+              <Button size="xs" px={2} isDisabled>
+                <MdArrowBack size="16px" />
+              </Button>
+            </Tooltip>
+            
+            <Tooltip label="Go Forward" placement="top" hasArrow openDelay={400}>
+              <Button size="xs" px={2} isDisabled>
+                <MdArrowForward size="16px" />
+              </Button>
+            </Tooltip>
+            
+            <Tooltip label="Refresh" placement="top" hasArrow openDelay={400}>
+              <Button size="xs" px={2} onClick={() => updateState(props._id, { url: s.url })}>
+                <MdRefresh size="16px" />
+              </Button>
+            </Tooltip>
+          </ButtonGroup>
 
-      {/* URL Input */}
-      <form onSubmit={navigateToUrl}>
-        <InputGroup size="xs" minWidth="200px">
-          <Input
-            placeholder="Enter URL or search term"
-            value={urlInput}
-            onChange={handleUrlChange}
-            backgroundColor="whiteAlpha.300"
-          />
-        </InputGroup>
-      </form>
+          {/* URL Input */}
+          <form onSubmit={navigateToUrl}>
+            <InputGroup size="xs" minWidth="200px">
+              <Input
+                placeholder="Enter URL or search term"
+                value={urlInput}
+                onChange={handleUrlChange}
+                backgroundColor="whiteAlpha.300"
+              />
+            </InputGroup>
+          </form>
 
-      <Tooltip label="Navigate" placement="top" hasArrow openDelay={400}>
-        <Button onClick={navigateToUrl} size="xs" colorScheme="teal" px={2}>
-          <MdOutlineSubdirectoryArrowLeft size="16px" />
-        </Button>
-      </Tooltip>
+          <Tooltip label="Navigate" placement="top" hasArrow openDelay={400}>
+            <Button onClick={navigateToUrl} size="xs" colorScheme="teal" px={2}>
+              <MdOutlineSubdirectoryArrowLeft size="16px" />
+            </Button>
+          </Tooltip>
 
-      {/* Sync Controls */}
-      <ButtonGroup isAttached size="xs" colorScheme="blue">
-        <Tooltip label={s.isRecording ? "Stop Recording" : "Start Recording"} placement="top" hasArrow openDelay={400}>
-          <Button 
-            onClick={toggleRecording} 
-            size="xs" 
-            px={2}
-            variant={s.isRecording ? "solid" : "outline"}
-            colorScheme={s.isRecording ? "red" : "blue"}
-          >
-            {s.isRecording ? <MdStop size="16px" /> : <MdRadioButtonChecked size="16px" />}
-          </Button>
-        </Tooltip>
-        
-        <Tooltip label={s.isReplaying ? "Stop Replaying" : "Start Replaying"} placement="top" hasArrow openDelay={400}>
-          <Button 
-            onClick={toggleReplaying} 
-            size="xs" 
-            px={2}
-            variant={s.isReplaying ? "solid" : "outline"}
-            colorScheme={s.isReplaying ? "green" : "blue"}
-          >
-            <MdPlayArrow size="16px" />
-          </Button>
-        </Tooltip>
-      </ButtonGroup>
+          {/* Sync Controls */}
+          <ButtonGroup isAttached size="xs" colorScheme="blue">
+            <Tooltip label={s.isRecording ? "Stop Recording" : "Start Recording"} placement="top" hasArrow openDelay={400}>
+              <Button 
+                onClick={toggleRecording} 
+                size="xs" 
+                px={2}
+                variant={s.isRecording ? "solid" : "outline"}
+                colorScheme={s.isRecording ? "red" : "blue"}
+              >
+                {s.isRecording ? <MdStop size="16px" /> : <MdRadioButtonChecked size="16px" />}
+              </Button>
+            </Tooltip>
+            
+            <Tooltip label={s.isReplaying ? "Stop Replaying" : "Start Replaying"} placement="top" hasArrow openDelay={400}>
+              <Button 
+                onClick={toggleReplaying} 
+                size="xs" 
+                px={2}
+                variant={s.isReplaying ? "solid" : "outline"}
+                colorScheme={s.isReplaying ? "green" : "blue"}
+              >
+                <MdPlayArrow size="16px" />
+              </Button>
+            </Tooltip>
+          </ButtonGroup>
 
-      {/* Zoom Controls */}
-      <ButtonGroup isAttached size="xs" colorScheme="teal">
-        <Tooltip label="Zoom In" placement="top" hasArrow openDelay={400}>
-          <Button onClick={() => handleZoom('in')} size="xs" px={2}>
-            <MdAdd size="16px" />
-          </Button>
-        </Tooltip>
-        
-        <Tooltip label="Zoom Out" placement="top" hasArrow openDelay={400}>
-          <Button onClick={() => handleZoom('out')} size="xs" px={2}>
-            <MdRemove size="16px" />
-          </Button>
-        </Tooltip>
-      </ButtonGroup>
+          {/* Zoom Controls */}
+          <ButtonGroup isAttached size="xs" colorScheme="teal">
+            <Tooltip label="Zoom In" placement="top" hasArrow openDelay={400}>
+              <Button onClick={() => handleZoom('in')} size="xs" px={2}>
+                <MdAdd size="16px" />
+              </Button>
+            </Tooltip>
+            
+            <Tooltip label="Zoom Out" placement="top" hasArrow openDelay={400}>
+              <Button onClick={() => handleZoom('out')} size="xs" px={2}>
+                <MdRemove size="16px" />
+              </Button>
+            </Tooltip>
+          </ButtonGroup>
 
-      {/* Utility Controls */}
-      <ButtonGroup isAttached size="xs" colorScheme="teal">
-        <Tooltip label="Copy URL" placement="top" hasArrow openDelay={400}>
-          <Button onClick={copyUrl} size="xs" px={2}>
-            <MdCopyAll size="16px" />
-          </Button>
-        </Tooltip>
-        
-        <Tooltip label="Open in New Tab" placement="top" hasArrow openDelay={400}>
-          <Button onClick={openExternal} size="xs" px={2}>
-            <MdOpenInNew size="16px" />
-          </Button>
-        </Tooltip>
-      </ButtonGroup>
+          {/* Utility Controls */}
+          <ButtonGroup isAttached size="xs" colorScheme="teal">
+            <Tooltip label="Copy URL" placement="top" hasArrow openDelay={400}>
+              <Button onClick={copyUrl} size="xs" px={2}>
+                <MdCopyAll size="16px" />
+              </Button>
+            </Tooltip>
+            
+            <Tooltip label="Open in Desktop" placement="top" hasArrow openDelay={400}>
+              <Button onClick={openExternal} size="xs" px={2}>
+                <MdOpenInNew size="16px" />
+              </Button>
+            </Tooltip>
+          </ButtonGroup>
+        </>
+      ) : (
+        <>
+          {/* Browser-only controls */}
+          <Tooltip label="Open page in new tab" placement="top" hasArrow openDelay={400}>
+            <Button onClick={openExternal} size="xs" variant="solid" colorScheme="teal">
+              Open
+            </Button>
+          </Tooltip>
+          <Tooltip label="Copy URL" placement="top" hasArrow openDelay={400}>
+            <Button onClick={copyUrl} size="xs" variant="solid" colorScheme="teal">
+              Copy
+            </Button>
+          </Tooltip>
+        </>
+      )}
     </HStack>
   );
 }

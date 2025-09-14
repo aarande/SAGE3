@@ -28,7 +28,7 @@ export const schema = z.object({
 export type state = z.infer<typeof schema>;
 
 export const init: Partial<state> = {
-  url: 'https://www.google.com/',
+  url: 'https://example.com/',
   isRecording: false,
   isReplaying: false,
   lastEventTimestamp: 0,

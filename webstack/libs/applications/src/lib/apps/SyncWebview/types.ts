@@ -46,6 +46,14 @@ export interface MousePrediction {
   timestamp: number;
 }
 
+// Mouse move event for batching
+export interface MouseMoveEvent {
+  x: number;
+  y: number;
+  timestamp: number;
+  target?: string; // CSS selector of target element
+}
+
 // Mouse interaction state broadcasting
 export interface MouseInteractionState {
   type: 'mousedown' | 'mouseup' | 'dragstart' | 'dragend';
@@ -102,7 +110,7 @@ export interface WorkerMessage {
 }
 
 // Application event types for internal communication
-export type SyncWebviewAppEvent = 
+export type SyncWebviewAppEvent =
   | { type: 'START_RECORDING'; payload: { url: string } }
   | { type: 'STOP_RECORDING' }
   | { type: 'START_REPLAYING' }
