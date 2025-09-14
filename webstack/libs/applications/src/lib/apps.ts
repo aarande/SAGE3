@@ -32,6 +32,7 @@ import { name as SageCellName } from './apps/SageCell';
 import { name as SeerName } from './apps/Seer';
 import { name as SensorOverviewName } from './apps/SensorOverview';
 import { name as StickieName } from './apps/Stickie';
+import { name as SyncWebviewName } from './apps/SyncWebview';
 import { name as TimerName } from './apps/Timer';
 import { name as TwilioScreenshareName } from './apps/TwilioScreenshare';
 import { name as VegaLiteName } from './apps/VegaLite';
@@ -75,6 +76,7 @@ import SageCell from './apps/SageCell/SageCell';
 import Seer from './apps/Seer/Seer';
 import SensorOverview from './apps/SensorOverview/SensorOverview';
 import Stickie from './apps/Stickie/Stickie';
+import SyncWebview from './apps/SyncWebview/SyncWebview';
 import Timer from './apps/Timer/Timer';
 import TwilioScreenshare from './apps/TwilioScreenshare/TwilioScreenshare';
 import VegaLite from './apps/VegaLite/VegaLite';
@@ -243,6 +245,11 @@ export const Applications = {
     AppComponent: React.memo(Stickie.AppComponent),
     ToolbarComponent: Stickie.ToolbarComponent,
     GroupedToolbarComponent: Stickie.GroupedToolbarComponent,
+  },
+  [SyncWebviewName]: {
+    AppComponent: React.memo(SyncWebview.AppComponent),
+    ToolbarComponent: SyncWebview.ToolbarComponent,
+    GroupedToolbarComponent: SyncWebview.GroupedToolbarComponent,
   },
   [TimerName]: {
     AppComponent: React.memo(Timer.AppComponent),
