@@ -10,7 +10,8 @@ import {
   SyncWebviewEvent, 
   MouseMovementBatch, 
   MouseInteractionState,
-  PerformanceMetrics 
+  PerformanceMetrics,
+  CompressedSnapshot
 } from '../types';
 
 // rrweb type definitions
@@ -368,7 +369,44 @@ export class EventReplayService {
   }
 
   /**
-   * Apply a DOM snapshot to reset the state
+   * Apply a compressed DOM snapshot to reset the state
+   */
+  async applyCompressedSnapshot(compressedSnapshot: CompressedSnapshot): Promise<void> {
+    if (!this.isReplaying) {
+      console.warn('SyncWebview: Cannot apply snapshot, replay service not running');
+      return;
+    }
+
+    try {
+      // Import StateSynchronizationService for decompression
+      const { StateSynchronizationService } = await import('./StateSynchronizationService');
+      
+      // Create a temporary service instance for decompression
+      const tempService = new StateSynchronizationService(
+        () => {}, // onSnapshotGenerated - not needed for decompression
+        (error) => console.error('Temp service error:', error) // onError
+      );
+      
+      await tempService.initialize();
+      
+      // Decompress the snapshot
+      const decompressedData = await tempService.decompressSnapshot(compressedSnapshot);
+      
+      // Clean up temp service
+      tempService.destroy();
+      
+      // Apply the decompressed snapshot
+      await this.applyDecompressedSnapshot(decompressedData.events, decompressedData.timestamp);
+      
+      console.log(`SyncWebview: Applied compressed snapshot (${compressedSnapshot.compressionMethod}, ${compressedSnapshot.compressedSize} bytes)`);
+    } catch (error) {
+      console.error('SyncWebview: Failed to apply compressed snapshot:', error);
+      this.onReplayError(new Error('Failed to apply compressed snapshot'));
+    }
+  }
+
+  /**
+   * Apply a DOM snapshot to reset the state (legacy method for backward compatibility)
    */
   async applySnapshot(snapshot: string, timestamp: number): Promise<void> {
     if (!this.isReplaying) {
@@ -450,6 +488,73 @@ export class EventReplayService {
     } catch (error) {
       console.error('SyncWebview: Failed to apply snapshot:', error);
       this.onReplayError(new Error('Failed to apply DOM snapshot'));
+      
+      // Attempt recovery by restarting with empty state
+      this.recoverFromSnapshotError();
+    }
+  }
+
+  /**
+   * Apply decompressed snapshot data
+   */
+  private async applyDecompressedSnapshot(events: RrwebEvent[], timestamp: number): Promise<void> {
+    try {
+      // Validate snapshot data
+      if (!this.validateSnapshotData(events)) {
+        console.error('SyncWebview: Invalid decompressed snapshot data');
+        this.onReplayError(new Error('Invalid decompressed snapshot data'));
+        return;
+      }
+      
+      // Stop current replayer
+      if (this.replayer) {
+        this.replayer.pause();
+        if (typeof this.replayer.destroy === 'function') {
+          this.replayer.destroy();
+        }
+      }
+      
+      // Update current events with snapshot
+      this.currentEvents = events;
+      
+      // Create new replayer with snapshot data
+      const config = {
+        target: this.replayContainer!,
+        props: {
+          events: this.currentEvents,
+          autoPlay: false,
+          showController: false,
+          showWarning: false,
+          pauseAnimation: false,
+        },
+        insertStyleRules: [
+          '.rr-replayer { width: 100% !important; height: 100% !important; }',
+          '.rr-replayer iframe { border: none !important; width: 100% !important; height: 100% !important; }',
+          '.rr-replayer .rr-controller { display: none !important; }',
+        ],
+      };
+
+      if (this.rrweb) {
+        this.replayer = new this.rrweb.Replayer(this.currentEvents, config);
+        this.setupReplayerEventHandlers();
+        
+        // Start playback and seek to end for live mode
+        if (this.currentEvents.length > 0 && this.replayer) {
+          this.replayer.play();
+          this.replayer.play(this.currentEvents[this.currentEvents.length - 1].timestamp);
+        }
+      }
+      
+      this.lastEventTimestamp = timestamp;
+      
+      // Clear event queue since we have a fresh state
+      this.eventQueue = [];
+      this.performanceMetrics.eventQueueSize = 0;
+      
+      console.log('SyncWebview: Applied decompressed snapshot with', events.length, 'events');
+    } catch (error) {
+      console.error('SyncWebview: Failed to apply decompressed snapshot:', error);
+      this.onReplayError(new Error('Failed to apply decompressed snapshot'));
       
       // Attempt recovery by restarting with empty state
       this.recoverFromSnapshotError();

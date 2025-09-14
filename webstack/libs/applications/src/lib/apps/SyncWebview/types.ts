@@ -22,7 +22,7 @@ export interface SyncWebviewEvent {
 
 // WebSocket message format for SAGE3 communication
 export interface SyncWebviewWebSocketMessage {
-  type: 'syncwebview-event' | 'syncwebview-snapshot' | 'syncwebview-request-snapshot' | 'syncwebview-mouse-batch' | 'syncwebview-mouse-interaction';
+  type: 'syncwebview-event' | 'syncwebview-snapshot' | 'syncwebview-request-snapshot' | 'syncwebview-mouse-batch' | 'syncwebview-mouse-interaction' | 'syncwebview-navigation';
   appId: string;
   data: any; // rrweb event data or DOM snapshot
   timestamp: number;
@@ -126,6 +126,55 @@ export interface WorkerPerformanceMetrics extends PerformanceMetrics {
 // Mouse optimization strategies for different element types
 export type MouseStrategy = 'high-fidelity' | 'drag-optimized' | 'media-optimized' | 'standard';
 
+// Compressed snapshot data structure for state synchronization
+export interface CompressedSnapshot {
+  data: string; // Compressed snapshot data
+  timestamp: number;
+  url: string;
+  zoom: number;
+  compressionMethod: 'gzip' | 'lz4' | 'none';
+  originalSize: number;
+  compressedSize: number;
+}
+
+// Snapshot cache entry for managing cached snapshots
+export interface SnapshotCacheEntry {
+  snapshot: CompressedSnapshot;
+  createdAt: number;
+  lastAccessed: number;
+  accessCount: number;
+}
+
+// Snapshot request/response data structures
+export interface SnapshotRequest {
+  requesterId: string;
+  timestamp: number;
+  url?: string; // Optional URL filter
+}
+
+export interface SnapshotResponse {
+  snapshot: CompressedSnapshot;
+  providerId: string;
+  timestamp: number;
+}
+
+// Navigation state for tracking browser history
+export interface NavigationState {
+  canGoBack: boolean;
+  canGoForward: boolean;
+  currentIndex: number;
+  history: string[];
+}
+
+// Navigation event for synchronization across clients
+export interface NavigationEvent {
+  type: 'navigate' | 'back' | 'forward' | 'refresh';
+  url?: string;
+  timestamp: number;
+  userId: string;
+  sessionId: string;
+}
+
 // Application event types for internal communication
 export type SyncWebviewAppEvent =
   | { type: 'START_RECORDING'; payload: { url: string } }
@@ -136,7 +185,9 @@ export type SyncWebviewAppEvent =
   | { type: 'ZOOM_CHANGED'; payload: { zoom: number } }
   | { type: 'PRIVACY_UPDATED'; payload: { maskPasswords: boolean; maskElements: string[] } }
   | { type: 'EVENT_RECEIVED'; payload: SyncWebviewEvent }
-  | { type: 'SNAPSHOT_REQUESTED' }
-  | { type: 'SNAPSHOT_RECEIVED'; payload: { snapshot: string; timestamp: number } }
+  | { type: 'SNAPSHOT_REQUESTED'; payload: SnapshotRequest }
+  | { type: 'SNAPSHOT_RECEIVED'; payload: SnapshotResponse }
+  | { type: 'SNAPSHOT_GENERATED'; payload: CompressedSnapshot }
   | { type: 'MOUSE_BATCH_RECEIVED'; payload: MouseMovementBatch }
-  | { type: 'MOUSE_INTERACTION_RECEIVED'; payload: MouseInteractionState };
+  | { type: 'MOUSE_INTERACTION_RECEIVED'; payload: MouseInteractionState }
+  | { type: 'NAVIGATION_EVENT'; payload: NavigationEvent };

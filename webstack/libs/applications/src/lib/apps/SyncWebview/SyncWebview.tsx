@@ -41,11 +41,12 @@ import { useAppStore, useUser, processContentURL, useHexColor, useUIStore, useWi
 import { App } from '../../schema';
 import { state as AppState } from './index';
 import { AppWindow, ElectronRequired } from '../../components';
-import { SyncWebviewEvent, SyncWebviewWebSocketMessage, MouseMovementBatch, MouseInteractionState } from './types';
+import { SyncWebviewEvent, SyncWebviewWebSocketMessage, MouseMovementBatch, MouseInteractionState, CompressedSnapshot, SnapshotRequest, NavigationEvent } from './types';
 import { EventRecorderService } from './services/EventRecorderService';
 import { WorkerManagerService } from './services/WorkerManagerService';
 import { WebSocketService } from './services/WebSocketService';
 import { EventReplayService } from './services/EventReplayService';
+import { StateSynchronizationService } from './services/StateSynchronizationService';
 
 // Electron webview type
 // @ts-ignore
@@ -73,12 +74,15 @@ function AppComponent(props: App): JSX.Element {
   const [isRecording, setIsRecording] = useState<boolean>(s.isRecording);
   const [isReplaying, setIsReplaying] = useState<boolean>(s.isReplaying);
   const [zoom, setZoom] = useState<number>(s.zoom);
+  const [canGoBack, setCanGoBack] = useState<boolean>(s.navigation?.canGoBack || false);
+  const [canGoForward, setCanGoForward] = useState<boolean>(s.navigation?.canGoForward || false);
 
   // rrweb Services
   const recorderServiceRef = useRef<EventRecorderService | null>(null);
   const workerManagerRef = useRef<WorkerManagerService | null>(null);
   const webSocketServiceRef = useRef<WebSocketService | null>(null);
   const replayServiceRef = useRef<EventReplayService | null>(null);
+  const stateSyncServiceRef = useRef<StateSynchronizationService | null>(null);
 
   // UI
   const boardDragging = useUIStore((state) => state.boardDragging);
@@ -100,7 +104,9 @@ function AppComponent(props: App): JSX.Element {
     setIsRecording(s.isRecording);
     setIsReplaying(s.isReplaying);
     setZoom(s.zoom);
-  }, [s.url, s.isRecording, s.isReplaying, s.zoom]);
+    setCanGoBack(s.navigation?.canGoBack || false);
+    setCanGoForward(s.navigation?.canGoForward || false);
+  }, [s.url, s.isRecording, s.isReplaying, s.zoom, s.navigation?.canGoBack, s.navigation?.canGoForward]);
 
   // Initialize rrweb services
   useEffect(() => {
@@ -120,7 +126,8 @@ function AppComponent(props: App): JSX.Element {
           handleMouseBatchReceived,
           handleMouseInteractionReceived,
           handleWebSocketError,
-          handleSnapshotRequested
+          handleSnapshotRequested,
+          handleNavigationReceived
         );
         await webSocketService.initialize();
         webSocketServiceRef.current = webSocketService;
@@ -132,6 +139,14 @@ function AppComponent(props: App): JSX.Element {
         );
         // We'll initialize this when we have a target element
         replayServiceRef.current = replayService;
+
+        // Initialize State Synchronization Service
+        const stateSyncService = new StateSynchronizationService(
+          handleSnapshotGenerated,
+          handleStateSyncError
+        );
+        await stateSyncService.initialize();
+        stateSyncServiceRef.current = stateSyncService;
 
         // Initialize Worker Manager
         const workerManager = new WorkerManagerService(
@@ -185,6 +200,9 @@ function AppComponent(props: App): JSX.Element {
       if (replayServiceRef.current) {
         replayServiceRef.current.stopReplaying();
       }
+      if (stateSyncServiceRef.current) {
+        stateSyncServiceRef.current.destroy();
+      }
     };
   }, [props._id, user?._id, user?.data.name, boardId, toast]);
 
@@ -200,7 +218,7 @@ function AppComponent(props: App): JSX.Element {
           
           // Request snapshot from other clients if this is a late joiner
           if (webSocketServiceRef.current && webSocketServiceRef.current.getIsInitialized()) {
-            await webSocketServiceRef.current.requestSnapshot();
+            await webSocketServiceRef.current.requestSnapshot(s.url);
           }
           
           // Start replaying
@@ -252,6 +270,28 @@ function AppComponent(props: App): JSX.Element {
     }
   }, [s.privacy.maskPasswords, s.privacy.maskElements]);
 
+  // Update navigation state
+  const updateNavigationState = useCallback(() => {
+    if (!webviewRef.current) return;
+    
+    const newCanGoBack = webviewRef.current.canGoBack();
+    const newCanGoForward = webviewRef.current.canGoForward();
+    
+    if (newCanGoBack !== canGoBack || newCanGoForward !== canGoForward) {
+      setCanGoBack(newCanGoBack);
+      setCanGoForward(newCanGoForward);
+      
+      // Update app state with navigation capabilities
+      updateState(props._id, {
+        navigation: {
+          ...s.navigation,
+          canGoBack: newCanGoBack,
+          canGoForward: newCanGoForward,
+        }
+      });
+    }
+  }, [canGoBack, canGoForward, props._id, updateState, s.navigation]);
+
   // Init the webview (Electron only)
   const setWebviewRef = useCallback((node: WebviewTag) => {
     // event did-attach callback
@@ -266,6 +306,54 @@ function AppComponent(props: App): JSX.Element {
       setDomReady(true);
     };
 
+    // Navigation event handlers
+    const didNavigate = (event: any) => {
+      console.log('SyncWebview: Navigation completed to:', event.url);
+      
+      // Update URL in state if it changed
+      if (event.url !== url) {
+        setUrl(event.url);
+        updateState(props._id, { url: event.url });
+        
+        // Update navigation history
+        const currentHistory = s.navigation?.history || [];
+        const currentIndex = s.navigation?.currentIndex || 0;
+        
+        // Add new URL to history (remove any forward history)
+        const newHistory = [...currentHistory.slice(0, currentIndex + 1), event.url];
+        const newIndex = newHistory.length - 1;
+        
+        updateState(props._id, {
+          navigation: {
+            ...s.navigation,
+            history: newHistory,
+            currentIndex: newIndex,
+          }
+        });
+        
+        // Broadcast navigation event
+        const navigationEvent: NavigationEvent = {
+          type: 'navigate',
+          url: event.url,
+          timestamp: Date.now(),
+          userId: user?._id || 'anonymous',
+          sessionId: props._id
+        };
+        
+        if (webSocketServiceRef.current && webSocketServiceRef.current.getIsInitialized()) {
+          webSocketServiceRef.current.broadcastNavigation(navigationEvent);
+        }
+      }
+      
+      // Update navigation state
+      setTimeout(updateNavigationState, 100); // Small delay to ensure webview state is updated
+    };
+
+    const didNavigateInPage = (event: any) => {
+      console.log('SyncWebview: In-page navigation to:', event.url);
+      updateNavigationState();
+    };
+
     if (node) {
       webviewRef.current = node;
       const webview = webviewRef.current;
@@ -277,6 +365,10 @@ function AppComponent(props: App): JSX.Element {
       webview.addEventListener('dom-ready', domReadyCallback);
       webview.addEventListener('did-attach', didAttachCallback);
 
+      // Navigation event listeners
+      webview.addEventListener('did-navigate', didNavigate);
+      webview.addEventListener('did-navigate-in-page', didNavigateInPage);
+
       const titleUpdated = (event: any) => {
         // Update the app title
         update(props._id, { title: event.title });
@@ -286,7 +378,7 @@ function AppComponent(props: App): JSX.Element {
       // After the partition has been set, you can navigate
       webview.src = url;
     }
-  }, [props._id, update, url]);
+  }, [props._id, update, url, updateNavigationState, user?._id, s.navigation, updateState]);
 
   // Load URL in webview (Electron only)
   const loadURL = useCallback((newUrl: string) => {
@@ -305,6 +397,9 @@ function AppComponent(props: App): JSX.Element {
           });
         });
         setUrl(newUrl);
+        
+        // Update app state with new URL
+        updateState(props._id, { url: newUrl });
       } catch (error) {
         console.error('SyncWebview> Error loading URL:', newUrl, error);
         toast({
@@ -315,7 +410,7 @@ function AppComponent(props: App): JSX.Element {
         });
       }
     }
-  }, [domReady, attached, toast]);
+  }, [domReady, attached, toast, props._id, updateState]);
 
   // Update to URL from backend
   useEffect(() => {
@@ -327,6 +422,73 @@ function AppComponent(props: App): JSX.Element {
     }
   }, [s.url, url, loadURL]);
 
+  // Navigation functions
+  const goBack = useCallback(() => {
+    if (!webviewRef.current || !canGoBack) return;
+    
+    try {
+      webviewRef.current.goBack();
+      
+      // Broadcast navigation event
+      const navigationEvent: NavigationEvent = {
+        type: 'back',
+        timestamp: Date.now(),
+        userId: user?._id || 'anonymous',
+        sessionId: props._id
+      };
+      
+      if (webSocketServiceRef.current && webSocketServiceRef.current.getIsInitialized()) {
+        webSocketServiceRef.current.broadcastNavigation(navigationEvent);
+      }
+    } catch (error) {
+      console.error('SyncWebview: Error going back:', error);
+    }
+  }, [canGoBack, user?._id, props._id]);
+
+  const goForward = useCallback(() => {
+    if (!webviewRef.current || !canGoForward) return;
+    
+    try {
+      webviewRef.current.goForward();
+      
+      // Broadcast navigation event
+      const navigationEvent: NavigationEvent = {
+        type: 'forward',
+        timestamp: Date.now(),
+        userId: user?._id || 'anonymous',
+        sessionId: props._id
+      };
+      
+      if (webSocketServiceRef.current && webSocketServiceRef.current.getIsInitialized()) {
+        webSocketServiceRef.current.broadcastNavigation(navigationEvent);
+      }
+    } catch (error) {
+      console.error('SyncWebview: Error going forward:', error);
+    }
+  }, [canGoForward, user?._id, props._id]);
+
+  const refresh = useCallback(() => {
+    if (!webviewRef.current) return;
+    
+    try {
+      webviewRef.current.reload();
+      
+      // Broadcast navigation event
+      const navigationEvent: NavigationEvent = {
+        type: 'refresh',
+        timestamp: Date.now(),
+        userId: user?._id || 'anonymous',
+        sessionId: props._id
+      };
+      
+      if (webSocketServiceRef.current && webSocketServiceRef.current.getIsInitialized()) {
+        webSocketServiceRef.current.broadcastNavigation(navigationEvent);
+      }
+    } catch (error) {
+      console.error('SyncWebview: Error refreshing:', error);
+    }
+  }, [user?._id, props._id]);
+
   // Set zoom when it changes
   useEffect(() => {
     if (domReady === false || attached === false) return;
@@ -335,6 +497,47 @@ function AppComponent(props: App): JSX.Element {
       webviewRef.current.setZoomFactor(s.zoom);
     }
   }, [s.zoom, domReady, attached]);
+
+  // Listen for navigation events from toolbar
+  useEffect(() => {
+    const handleNavigationEvent = (event: CustomEvent) => {
+      const { type, url: navUrl } = event.detail;
+      
+      switch (type) {
+        case 'navigate':
+          if (navUrl) {
+            // Broadcast navigation event
+            const navigationEvent: NavigationEvent = {
+              type: 'navigate',
+              url: navUrl,
+              timestamp: Date.now(),
+              userId: user?._id || 'anonymous',
+              sessionId: props._id
+            };
+            
+            if (webSocketServiceRef.current && webSocketServiceRef.current.getIsInitialized()) {
+              webSocketServiceRef.current.broadcastNavigation(navigationEvent);
+            }
+          }
+          break;
+        case 'back':
+          goBack();
+          break;
+        case 'forward':
+          goForward();
+          break;
+        case 'refresh':
+          refresh();
+          break;
+      }
+    };
+
+    window.addEventListener('syncwebview-navigate', handleNavigationEvent as EventListener);
+    
+    return () => {
+      window.removeEventListener('syncwebview-navigate', handleNavigationEvent as EventListener);
+    };
+  }, [goBack, goForward, refresh, user?._id, props._id]);
 
   // Event handling functions for rrweb
   const handleRecordedEvent = useCallback((event: SyncWebviewEvent) => {
@@ -420,16 +623,21 @@ function AppComponent(props: App): JSX.Element {
     updateState(props._id, { lastEventTimestamp: event.timestamp });
   }, [props._id, updateState]);
 
-  const handleSnapshotReceived = useCallback((snapshot: string, timestamp: number) => {
-    console.log('SyncWebview: Received snapshot from other client');
+  const handleSnapshotReceived = useCallback((compressedSnapshot: CompressedSnapshot) => {
+    console.log('SyncWebview: Received compressed snapshot from other client');
     
-    // Apply snapshot to replay service
+    // Apply compressed snapshot to replay service
     if (replayServiceRef.current && replayServiceRef.current.getIsReplaying()) {
-      replayServiceRef.current.applySnapshot(snapshot, timestamp);
+      replayServiceRef.current.applyCompressedSnapshot(compressedSnapshot);
+    }
+    
+    // Cache the received snapshot
+    if (stateSyncServiceRef.current && stateSyncServiceRef.current.getIsInitialized()) {
+      stateSyncServiceRef.current.cacheSnapshot(compressedSnapshot);
     }
     
     // Update last event timestamp
-    updateState(props._id, { lastEventTimestamp: timestamp });
+    updateState(props._id, { lastEventTimestamp: compressedSnapshot.timestamp });
   }, [props._id, updateState]);
 
   const handleMouseBatchReceived = useCallback((batch: MouseMovementBatch) => {
@@ -481,31 +689,116 @@ function AppComponent(props: App): JSX.Element {
     console.log('SyncWebview: Replay completed');
   }, []);
 
-  const handleSnapshotRequested = useCallback(async (requesterId: string) => {
-    console.log('SyncWebview: Snapshot requested by:', requesterId);
+  const handleSnapshotGenerated = useCallback((snapshot: CompressedSnapshot) => {
+    console.log('SyncWebview: Snapshot generated:', {
+      size: snapshot.compressedSize,
+      compression: snapshot.compressionMethod,
+      url: snapshot.url
+    });
     
-    // Generate snapshot using recorder service
-    if (recorderServiceRef.current && recorderServiceRef.current.getIsRecording()) {
+    // Get cache statistics
+    const cacheStats = stateSyncServiceRef.current?.getCacheStats();
+    const compressionRatio = snapshot.originalSize > 0 ? 
+      (snapshot.originalSize - snapshot.compressedSize) / snapshot.originalSize : 0;
+    
+    // Update app state with snapshot information
+    updateState(props._id, { 
+      lastEventTimestamp: snapshot.timestamp,
+      recordingError: null, // Clear any previous errors
+      snapshotCache: {
+        lastSnapshotTimestamp: snapshot.timestamp,
+        cacheSize: cacheStats?.size || 0,
+        compressionRatio: compressionRatio,
+      }
+    });
+  }, [props._id, updateState]);
+
+  const handleStateSyncError = useCallback((error: Error) => {
+    console.error('SyncWebview: State synchronization error:', error);
+    updateState(props._id, { recordingError: 'State synchronization error' });
+    toast({
+      title: 'Synchronization Error',
+      description: 'Error with state synchronization service',
+      status: 'warning',
+      duration: 3000,
+    });
+  }, [props._id, updateState, toast]);
+
+  const handleSnapshotRequested = useCallback(async (request: SnapshotRequest) => {
+    console.log('SyncWebview: Snapshot requested by:', request.requesterId);
+    
+    // Check if we have a cached snapshot first
+    if (stateSyncServiceRef.current && stateSyncServiceRef.current.getIsInitialized()) {
+      const cachedSnapshot = stateSyncServiceRef.current.getCachedSnapshot(s.url);
+      if (cachedSnapshot) {
+        console.log('SyncWebview: Sending cached snapshot');
+        if (webSocketServiceRef.current && webSocketServiceRef.current.getIsInitialized()) {
+          await webSocketServiceRef.current.broadcastSnapshot(cachedSnapshot);
+        }
+        return;
+      }
+    }
+    
+    // Generate new snapshot using recorder service
+    if (recorderServiceRef.current && recorderServiceRef.current.getIsRecording() && 
+        stateSyncServiceRef.current && stateSyncServiceRef.current.getIsInitialized()) {
       try {
-        // This would need to be implemented in EventRecorderService
-        // For now, we'll create a placeholder snapshot
-        const snapshot = JSON.stringify({
-          type: 'snapshot',
-          timestamp: Date.now(),
-          url: s.url,
-          zoom: s.zoom
-        });
+        // Get current recorded events
+        const events = recorderServiceRef.current.generateSnapshot(s.url, s.zoom);
+        
+        // Generate compressed snapshot
+        const compressedSnapshot = await stateSyncServiceRef.current.generateSnapshot(
+          events,
+          s.url,
+          s.zoom,
+          'gzip' // Use gzip compression by default
+        );
         
         // Send snapshot via WebSocket service
         if (webSocketServiceRef.current && webSocketServiceRef.current.getIsInitialized()) {
-          await webSocketServiceRef.current.broadcastSnapshot(snapshot);
-          console.log('SyncWebview: Sent snapshot to requester');
+          await webSocketServiceRef.current.broadcastSnapshot(compressedSnapshot);
+          console.log('SyncWebview: Sent generated snapshot to requester');
         }
       } catch (error) {
         console.error('SyncWebview: Failed to generate snapshot:', error);
+        updateState(props._id, { recordingError: 'Failed to generate snapshot' });
       }
     }
-  }, [s.url, s.zoom]);
+  }, [s.url, s.zoom, props._id, updateState]);
+
+  const handleNavigationReceived = useCallback((navigation: NavigationEvent) => {
+    console.log('SyncWebview: Received navigation event from other client:', navigation);
+    
+    if (!webviewRef.current || !domReady || !attached) {
+      console.warn('SyncWebview: Webview not ready for navigation');
+      return;
+    }
+
+    try {
+      switch (navigation.type) {
+        case 'navigate':
+          if (navigation.url && navigation.url !== url) {
+            loadURL(navigation.url);
+          }
+          break;
+        case 'back':
+          if (webviewRef.current.canGoBack()) {
+            webviewRef.current.goBack();
+          }
+          break;
+        case 'forward':
+          if (webviewRef.current.canGoForward()) {
+            webviewRef.current.goForward();
+          }
+          break;
+        case 'refresh':
+          webviewRef.current.reload();
+          break;
+      }
+    } catch (error) {
+      console.error('SyncWebview: Error handling navigation event:', error);
+    }
+  }, [url, loadURL, domReady, attached]);
 
   const broadcastEvent = useCallback((event: SyncWebviewEvent) => {
     // Broadcast through WebSocket service
@@ -623,6 +916,13 @@ function ToolbarComponent(props: App): JSX.Element {
     try {
       const validUrl = new URL(url).toString();
       updateState(props._id, { url: validUrl });
+      
+      // Trigger navigation event for synchronization
+      const event = new CustomEvent('syncwebview-navigate', { 
+        detail: { type: 'navigate', url: validUrl } 
+      });
+      window.dispatchEvent(event);
+      
       toast({
         title: 'Navigating',
         description: 'Loading new URL',
@@ -707,19 +1007,51 @@ function ToolbarComponent(props: App): JSX.Element {
           {/* Navigation Controls - Only in Electron */}
           <ButtonGroup isAttached size="xs" colorScheme="teal">
             <Tooltip label="Go Back" placement="top" hasArrow openDelay={400}>
-              <Button size="xs" px={2} isDisabled>
+              <Button 
+                size="xs" 
+                px={2} 
+                isDisabled={!s.navigation?.canGoBack}
+                onClick={() => {
+                  // Trigger navigation in the main component
+                  const event = new CustomEvent('syncwebview-navigate', { 
+                    detail: { type: 'back' } 
+                  });
+                  window.dispatchEvent(event);
+                }}
+              >
                 <MdArrowBack size="16px" />
               </Button>
             </Tooltip>
             
             <Tooltip label="Go Forward" placement="top" hasArrow openDelay={400}>
-              <Button size="xs" px={2} isDisabled>
+              <Button 
+                size="xs" 
+                px={2} 
+                isDisabled={!s.navigation?.canGoForward}
+                onClick={() => {
+                  // Trigger navigation in the main component
+                  const event = new CustomEvent('syncwebview-navigate', { 
+                    detail: { type: 'forward' } 
+                  });
+                  window.dispatchEvent(event);
+                }}
+              >
                 <MdArrowForward size="16px" />
               </Button>
             </Tooltip>
             
             <Tooltip label="Refresh" placement="top" hasArrow openDelay={400}>
-              <Button size="xs" px={2} onClick={() => updateState(props._id, { url: s.url })}>
+              <Button 
+                size="xs" 
+                px={2} 
+                onClick={() => {
+                  // Trigger navigation in the main component
+                  const event = new CustomEvent('syncwebview-navigate', { 
+                    detail: { type: 'refresh' } 
+                  });
+                  window.dispatchEvent(event);
+                }}
+              >
                 <MdRefresh size="16px" />
               </Button>
             </Tooltip>
@@ -842,6 +1174,19 @@ function ToolbarComponent(props: App): JSX.Element {
                 {Math.round(zoom * 100)}%
               </Text>
             </Tooltip>
+
+            {/* Snapshot Cache Info */}
+            {s.snapshotCache && s.snapshotCache.cacheSize > 0 && (
+              <Tooltip 
+                label={`Snapshot cache: ${s.snapshotCache.cacheSize} entries, ${Math.round(s.snapshotCache.compressionRatio * 100)}% compression`} 
+                placement="top" 
+                hasArrow
+              >
+                <Text fontSize="xs" color="blue.500">
+                  Cache: {s.snapshotCache.cacheSize}
+                </Text>
+              </Tooltip>
+            )}
           </HStack>
         </>
       ) : (

@@ -29,6 +29,17 @@ export const schema = z.object({
     syncwebviewMessage: z.any(),
     timestamp: z.number(),
   }).optional(),
+  snapshotCache: z.object({
+    lastSnapshotTimestamp: z.number().default(0),
+    cacheSize: z.number().default(0),
+    compressionRatio: z.number().default(0),
+  }).default({}),
+  navigation: z.object({
+    canGoBack: z.boolean().default(false),
+    canGoForward: z.boolean().default(false),
+    currentIndex: z.number().default(0),
+    history: z.array(z.string()).default([]),
+  }).default({}),
 });
 
 export type state = z.infer<typeof schema>;
@@ -44,6 +55,17 @@ export const init: Partial<state> = {
   privacy: {
     maskPasswords: true,
     maskElements: [],
+  },
+  snapshotCache: {
+    lastSnapshotTimestamp: 0,
+    cacheSize: 0,
+    compressionRatio: 0,
+  },
+  navigation: {
+    canGoBack: false,
+    canGoForward: false,
+    currentIndex: 0,
+    history: ['https://example.com/'],
   },
 };
 

@@ -8,7 +8,7 @@
 
 import { record } from 'rrweb';
 import type { eventWithTime, listenerHandler } from 'rrweb/typings/types';
-import { SyncWebviewEvent, RecorderConfig, MouseEventContext, MouseMoveEvent, MouseMovementBatch, MouseInteractionState } from '../types';
+import { SyncWebviewEvent, RecorderConfig, MouseEventContext, MouseMoveEvent, MouseMovementBatch, MouseInteractionState, CompressedSnapshot } from '../types';
 import { MouseOptimizationService } from './MouseOptimizationService';
 
 /**
@@ -321,5 +321,52 @@ export class EventRecorderService {
    */
   public clearEventBuffer(): void {
     this.eventBuffer = [];
+  }
+
+  /**
+   * Generate a snapshot from current recorded events
+   */
+  public generateSnapshot(url: string, zoom: number): SyncWebviewEvent[] {
+    if (!this.isRecording) {
+      console.warn('EventRecorderService: Cannot generate snapshot, not currently recording');
+      return [];
+    }
+
+    try {
+      // Convert buffered rrweb events to SyncWebview events
+      const snapshotEvents: SyncWebviewEvent[] = this.eventBuffer.map((event, index) => ({
+        id: `${this.sessionId}-snapshot-${Date.now()}-${index}`,
+        timestamp: event.timestamp,
+        type: 'rrweb' as const,
+        data: event,
+        userId: this.userId,
+        sessionId: this.sessionId,
+      }));
+
+      console.log(`EventRecorderService: Generated snapshot with ${snapshotEvents.length} events`);
+      return snapshotEvents;
+    } catch (error) {
+      console.error('EventRecorderService: Failed to generate snapshot:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Get current recording statistics
+   */
+  public getRecordingStats(): {
+    isRecording: boolean;
+    eventCount: number;
+    bufferSize: number;
+    sessionId: string;
+    userId: string;
+  } {
+    return {
+      isRecording: this.isRecording,
+      eventCount: this.eventBuffer.length,
+      bufferSize: this.eventBuffer.length,
+      sessionId: this.sessionId,
+      userId: this.userId,
+    };
   }
 }
