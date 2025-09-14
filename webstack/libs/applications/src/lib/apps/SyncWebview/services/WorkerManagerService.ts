@@ -19,6 +19,11 @@ export class WorkerManagerService {
   private eventCallback: (event: SyncWebviewEvent) => void;
   private batchCallback: (batch: any) => void;
   private errorCallback: (error: any) => void;
+  private performanceMonitor = {
+    sentMessages: new Map<string, number>(), // messageId -> timestamp
+    networkLatencies: [] as number[],
+    maxLatencyHistory: 100,
+  };
 
   constructor(
     eventCallback: (event: SyncWebviewEvent) => void,
@@ -60,7 +65,7 @@ export class WorkerManagerService {
   }
 
   /**
-   * Send event to worker for processing
+   * Send event to worker for processing with performance tracking
    */
   public processEvent(event: SyncWebviewEvent): void {
     if (!this.worker || !this.isInitialized) {
@@ -69,12 +74,16 @@ export class WorkerManagerService {
       return;
     }
 
+    const messageId = `${event.id}-${Date.now()}`;
     const message: WorkerMessage = {
       type: 'event',
-      payload: event,
+      payload: { ...event, messageId },
       timestamp: Date.now(),
     };
 
+    // Track message for latency monitoring
+    this.performanceMonitor.sentMessages.set(messageId, Date.now());
+    
     this.worker.postMessage(message);
   }
 
@@ -160,6 +169,11 @@ export class WorkerManagerService {
     this.worker.onmessage = (event: MessageEvent<WorkerMessage>) => {
       const { type, payload } = event.data;
 
+      // Track network latency if message has ID
+      if (payload?.messageId) {
+        this.trackNetworkLatency(payload.messageId);
+      }
+
       switch (type) {
         case 'event':
           this.eventCallback(payload as SyncWebviewEvent);
@@ -206,6 +220,59 @@ export class WorkerManagerService {
   }
 
   /**
+   * Track network latency for performance monitoring
+   */
+  private trackNetworkLatency(messageId: string): void {
+    const sentTime = this.performanceMonitor.sentMessages.get(messageId);
+    if (sentTime) {
+      const latency = Date.now() - sentTime;
+      this.performanceMonitor.networkLatencies.push(latency);
+      
+      // Keep only recent latencies
+      if (this.performanceMonitor.networkLatencies.length > this.performanceMonitor.maxLatencyHistory) {
+        this.performanceMonitor.networkLatencies = this.performanceMonitor.networkLatencies.slice(-this.performanceMonitor.maxLatencyHistory);
+      }
+      
+      // Send average latency back to worker
+      const avgLatency = this.performanceMonitor.networkLatencies.reduce((a, b) => a + b, 0) / this.performanceMonitor.networkLatencies.length;
+      this.updateWorkerNetworkLatency(avgLatency);
+      
+      // Clean up tracked message
+      this.performanceMonitor.sentMessages.delete(messageId);
+    }
+  }
+
+  /**
+   * Update worker with current network latency
+   */
+  private updateWorkerNetworkLatency(latency: number): void {
+    if (!this.worker || !this.isInitialized) return;
+
+    const message: WorkerMessage = {
+      type: 'config',
+      payload: { networkLatency: latency },
+      timestamp: Date.now(),
+    };
+
+    this.worker.postMessage(message);
+  }
+
+  /**
+   * Get current performance metrics
+   */
+  public getPerformanceMetrics(): any {
+    const avgLatency = this.performanceMonitor.networkLatencies.length > 0
+      ? this.performanceMonitor.networkLatencies.reduce((a, b) => a + b, 0) / this.performanceMonitor.networkLatencies.length
+      : 0;
+
+    return {
+      averageNetworkLatency: avgLatency,
+      recentLatencies: this.performanceMonitor.networkLatencies.slice(-10),
+      pendingMessages: this.performanceMonitor.sentMessages.size,
+    };
+  }
+
+  /**
    * Get the worker code as a string (inline worker)
    */
   private getWorkerCode(): string {
@@ -216,7 +283,9 @@ export class WorkerManagerService {
           this.eventQueue = [];
           this.mouseEventBuffer = [];
           this.batchTimer = null;
-          this.BATCH_INTERVAL = 100;
+          this.batchInterval = 100;
+          this.MIN_BATCH_INTERVAL = 16;
+          this.MAX_BATCH_INTERVAL = 500;
           this.MAX_QUEUE_SIZE = 1000;
           this.MAX_MOUSE_BUFFER = 50;
           this.performanceMetrics = {
@@ -224,6 +293,12 @@ export class WorkerManagerService {
             networkLatency: 0,
             processingDelay: 0,
             clientPerformance: 'medium',
+          };
+          this.adaptiveSampling = {
+            mouseSamplingRate: 100,
+            eventDropRate: 0,
+            lastAdaptation: Date.now(),
+            adaptationInterval: 1000,
           };
           this.startBatchProcessor();
         }
@@ -262,6 +337,10 @@ export class WorkerManagerService {
         }
 
         handleEvent(event) {
+          if (this.shouldDropEvent(event)) {
+            return;
+          }
+
           if (this.isMouseMoveEvent(event)) {
             this.bufferMouseEvent(event);
             return;
@@ -294,6 +373,9 @@ export class WorkerManagerService {
 
         updateConfig(config) {
           console.log('EventProcessor: Configuration updated:', config);
+          if (config.networkLatency !== undefined) {
+            this.performanceMetrics.networkLatency = config.networkLatency;
+          }
         }
 
         isMouseMoveEvent(event) {
@@ -308,6 +390,11 @@ export class WorkerManagerService {
         }
 
         bufferMouseEvent(event) {
+          const timeSinceLastMouse = Date.now() - (this.mouseEventBuffer[this.mouseEventBuffer.length - 1]?.timestamp || 0);
+          if (timeSinceLastMouse < this.adaptiveSampling.mouseSamplingRate) {
+            return;
+          }
+
           const mouseEvent = {
             x: event.data.data.x,
             y: event.data.data.y,
@@ -359,7 +446,15 @@ export class WorkerManagerService {
         startBatchProcessor() {
           this.batchTimer = setInterval(() => {
             this.processBatch();
-          }, this.BATCH_INTERVAL);
+            this.adaptPerformance();
+          }, this.batchInterval);
+        }
+
+        restartBatchProcessor() {
+          if (this.batchTimer) {
+            clearInterval(this.batchTimer);
+          }
+          this.startBatchProcessor();
         }
 
         processBatch() {
@@ -488,7 +583,83 @@ export class WorkerManagerService {
           }
         }
 
+        shouldDropEvent(event) {
+          if (this.isHighPriorityEvent(event)) {
+            return false;
+          }
+          return Math.random() < this.adaptiveSampling.eventDropRate;
+        }
+
+        adaptPerformance() {
+          const now = Date.now();
+          
+          if (now - this.adaptiveSampling.lastAdaptation < this.adaptiveSampling.adaptationInterval) {
+            return;
+          }
+
+          const queueSize = this.performanceMetrics.eventQueueSize;
+          const processingDelay = this.performanceMetrics.processingDelay;
+          const clientPerformance = this.performanceMetrics.clientPerformance;
+
+          let needsRestart = false;
+          const oldInterval = this.batchInterval;
+          
+          if (clientPerformance === 'low' || queueSize > 500) {
+            this.batchInterval = Math.min(this.batchInterval * 1.5, this.MAX_BATCH_INTERVAL);
+            this.adaptiveSampling.mouseSamplingRate = Math.min(this.adaptiveSampling.mouseSamplingRate * 1.5, 500);
+            this.adaptiveSampling.eventDropRate = Math.min(this.adaptiveSampling.eventDropRate + 0.1, 0.5);
+          } else if (clientPerformance === 'high' && queueSize < 100) {
+            this.batchInterval = Math.max(this.batchInterval * 0.8, this.MIN_BATCH_INTERVAL);
+            this.adaptiveSampling.mouseSamplingRate = Math.max(this.adaptiveSampling.mouseSamplingRate * 0.8, 50);
+            this.adaptiveSampling.eventDropRate = Math.max(this.adaptiveSampling.eventDropRate - 0.05, 0);
+          }
+
+          if (Math.abs(oldInterval - this.batchInterval) > 10) {
+            needsRestart = true;
+          }
+
+          if (queueSize > 800 || processingDelay > 100) {
+            this.batchInterval = this.MAX_BATCH_INTERVAL;
+            this.adaptiveSampling.eventDropRate = 0.7;
+            needsRestart = true;
+            
+            console.warn('EventProcessor: Emergency throttling activated', {
+              queueSize,
+              processingDelay,
+              newInterval: this.batchInterval,
+              dropRate: this.adaptiveSampling.eventDropRate
+            });
+          }
+
+          if (needsRestart) {
+            this.restartBatchProcessor();
+          }
+
+          this.adaptiveSampling.lastAdaptation = now;
+
+          if (oldInterval !== this.batchInterval) {
+            console.log('EventProcessor: Performance adapted', {
+              oldInterval,
+              newInterval: this.batchInterval,
+              mouseSamplingRate: this.adaptiveSampling.mouseSamplingRate,
+              eventDropRate: this.adaptiveSampling.eventDropRate,
+              queueSize,
+              clientPerformance
+            });
+          }
+        }
+
         postMessage(message) {
+          if (message.type === 'batch' || message.type === 'event') {
+            message.payload = {
+              ...message.payload,
+              workerMetrics: {
+                ...this.performanceMetrics,
+                adaptiveSampling: this.adaptiveSampling,
+                batchInterval: this.batchInterval,
+              }
+            };
+          }
           self.postMessage(message);
         }
       }

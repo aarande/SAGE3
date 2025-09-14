@@ -109,6 +109,20 @@ export interface WorkerMessage {
   timestamp: number;
 }
 
+// Enhanced performance metrics with adaptive sampling
+export interface AdaptiveSamplingConfig {
+  mouseSamplingRate: number; // Dynamic mouse sampling rate in ms
+  eventDropRate: number; // Percentage of events to drop under load (0-1)
+  lastAdaptation: number; // Timestamp of last adaptation
+  adaptationInterval: number; // How often to adapt performance in ms
+}
+
+// Worker performance metrics
+export interface WorkerPerformanceMetrics extends PerformanceMetrics {
+  adaptiveSampling: AdaptiveSamplingConfig;
+  batchInterval: number; // Current batch processing interval
+}
+
 // Application event types for internal communication
 export type SyncWebviewAppEvent =
   | { type: 'START_RECORDING'; payload: { url: string } }
