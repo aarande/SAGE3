@@ -19,6 +19,8 @@ export const schema = z.object({
   isReplaying: z.boolean().default(false),
   lastEventTimestamp: z.number().default(0),
   zoom: z.number().default(1.0),
+  connectionStatus: z.enum(['disconnected', 'connecting', 'connected']).default('disconnected'),
+  recordingError: z.string().nullable().default(null),
   privacy: z.object({
     maskPasswords: z.boolean().default(true),
     maskElements: z.array(z.string()).default([]),
@@ -37,6 +39,8 @@ export const init: Partial<state> = {
   isReplaying: false,
   lastEventTimestamp: 0,
   zoom: 1.0,
+  connectionStatus: 'disconnected',
+  recordingError: null,
   privacy: {
     maskPasswords: true,
     maskElements: [],

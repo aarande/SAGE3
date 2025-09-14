@@ -19,8 +19,7 @@ import {
   useToast, 
   useDisclosure,
   Box,
-  Text,
-  VStack
+  Text
 } from '@chakra-ui/react';
 import {
   MdArrowBack,
@@ -80,8 +79,6 @@ function AppComponent(props: App): JSX.Element {
   const workerManagerRef = useRef<WorkerManagerService | null>(null);
   const webSocketServiceRef = useRef<WebSocketService | null>(null);
   const replayServiceRef = useRef<EventReplayService | null>(null);
-  const [recordingError, setRecordingError] = useState<string | null>(null);
-  const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
 
   // UI
   const boardDragging = useUIStore((state) => state.boardDragging);
@@ -111,7 +108,7 @@ function AppComponent(props: App): JSX.Element {
 
     const initializeServices = async () => {
       try {
-        setConnectionStatus('connecting');
+        updateState(props._id, { connectionStatus: 'connecting' });
 
         // Initialize WebSocket Service first
         const webSocketService = new WebSocketService(
@@ -155,12 +152,14 @@ function AppComponent(props: App): JSX.Element {
         );
         recorderServiceRef.current = recorder;
 
-        setConnectionStatus('connected');
+        updateState(props._id, { connectionStatus: 'connected' });
         console.log('SyncWebview: All services initialized');
       } catch (error) {
         console.error('SyncWebview: Failed to initialize services:', error);
-        setRecordingError('Failed to initialize services');
-        setConnectionStatus('disconnected');
+        updateState(props._id, { 
+          recordingError: 'Failed to initialize services',
+          connectionStatus: 'disconnected'
+        });
         toast({
           title: 'Initialization Error',
           description: 'Failed to initialize SyncWebview services',
@@ -219,17 +218,22 @@ function AppComponent(props: App): JSX.Element {
                   password: s.privacy.maskPasswords,
                 },
               });
-              setRecordingError(null);
-              // Update state to reflect that recording has started
-              updateState(props._id, { isRecording: true });
+              // Update state to reflect that recording has started and clear any errors
+              updateState(props._id, { 
+                isRecording: true,
+                recordingError: null
+              });
               console.log('SyncWebview: Auto-started recording and replay');
             }
           }, 1000); // 1 second delay
         }
       } catch (error) {
         console.error('SyncWebview: Failed to initialize recording and replay:', error);
-        setRecordingError('Failed to start recording and replay');
-        updateState(props._id, { isRecording: false, isReplaying: false });
+        updateState(props._id, { 
+          recordingError: 'Failed to start recording and replay',
+          isRecording: false, 
+          isReplaying: false 
+        });
       }
     };
 
@@ -362,14 +366,14 @@ function AppComponent(props: App): JSX.Element {
 
   const handleWorkerError = useCallback((error: any) => {
     console.error('SyncWebview: Worker error:', error);
-    setRecordingError('Worker processing error');
+    updateState(props._id, { recordingError: 'Worker processing error' });
     toast({
       title: 'Processing Error',
       description: 'Event processing worker encountered an error',
       status: 'warning',
       duration: 3000,
     });
-  }, [toast]);
+  }, [props._id, updateState, toast]);
 
   const handleMouseBatch = useCallback((batch: any) => {
     // Handle optimized mouse movement batches
@@ -454,14 +458,14 @@ function AppComponent(props: App): JSX.Element {
 
   const handleWebSocketError = useCallback((error: Error) => {
     console.error('SyncWebview: WebSocket error:', error);
-    setConnectionStatus('disconnected');
+    updateState(props._id, { connectionStatus: 'disconnected' });
     toast({
       title: 'Connection Error',
       description: 'Lost connection to other clients',
       status: 'error',
       duration: 3000,
     });
-  }, [toast]);
+  }, [props._id, updateState, toast]);
 
   const handleReplayError = useCallback((error: Error) => {
     console.error('SyncWebview: Replay error:', error);
@@ -545,7 +549,7 @@ function AppComponent(props: App): JSX.Element {
 
   const webviewStyle: React.CSSProperties = {
     width: isFocused ? winWidth + 'px' : props.data.size.width + 'px',
-    height: isFocused ? winHeight - 40 + 'px' : props.data.size.height - 40 + 'px', // Account for status bar
+    height: isFocused ? winHeight + 'px' : props.data.size.height + 'px', // Use full application height
     border: 'none',
     background: 'white',
     visibility: boardDragging ? 'hidden' : 'visible',
@@ -554,56 +558,9 @@ function AppComponent(props: App): JSX.Element {
   return (
     <AppWindow app={props} hideBackgroundIcon={MdSync}>
       {isElectron() ? (
-        <VStack spacing={0} height="100%">
-          {/* Status Bar */}
-          <Box width="100%" p={2} bg="gray.100" borderBottom="1px solid" borderColor="gray.200">
-            <HStack justify="space-between">
-              <HStack>
-                <Text fontSize="sm" color="gray.600">
-                  Sync:
-                </Text>
-                {recordingError && (
-                  <HStack>
-                    <Text fontSize="sm" color="red.500">Error: {recordingError}</Text>
-                  </HStack>
-                )}
-                {!recordingError && connectionStatus === 'connected' && isRecording && (
-                  <HStack>
-                    <MdSync color="green" />
-                    <Text fontSize="sm" color="green.500">Active</Text>
-                  </HStack>
-                )}
-                {!recordingError && connectionStatus === 'connecting' && (
-                  <HStack>
-                    <MdSync color="orange" />
-                    <Text fontSize="sm" color="orange.500">Connecting</Text>
-                  </HStack>
-                )}
-                {!recordingError && connectionStatus === 'disconnected' && (
-                  <Text fontSize="sm" color="red.500">Disconnected</Text>
-                )}
-                {!recordingError && connectionStatus === 'connected' && !isRecording && (
-                  <Text fontSize="sm" color="gray.500">Ready</Text>
-                )}
-              </HStack>
-              <HStack spacing={4}>
-                {s.lastEventTimestamp > 0 && (
-                  <Text fontSize="xs" color="gray.500">
-                    Last Sync: {new Date(s.lastEventTimestamp).toLocaleTimeString()}
-                  </Text>
-                )}
-                <Text fontSize="xs" color="gray.500">
-                  Zoom: {Math.round(zoom * 100)}%
-                </Text>
-              </HStack>
-            </HStack>
-          </Box>
-
-          {/* Main Content Area */}
-          <Box flex={1} width="100%" position="relative">
-            <webview ref={setWebviewRef} style={webviewStyle} allowpopups={'true' as any}></webview>
-          </Box>
-        </VStack>
+        <Box width="100%" height="100%" position="relative">
+          <webview ref={setWebviewRef} style={webviewStyle} allowpopups={'true' as any}></webview>
+        </Box>
       ) : (
         <ElectronRequired appName={props.data.type} link={s.url} title={props.data.title} />
       )}
@@ -628,6 +585,13 @@ function ToolbarComponent(props: App): JSX.Element {
 
   // Check if running in Electron
   const clientIsElectron = isElectron();
+
+  // Get status information from app state
+  const connectionStatus = s.connectionStatus || 'disconnected';
+  const recordingError = s.recordingError || null;
+  const isRecording = s.isRecording;
+  const lastEventTimestamp = s.lastEventTimestamp;
+  const zoom = s.zoom;
 
   // Update local URL input when state changes
   useEffect(() => {
@@ -737,7 +701,7 @@ function ToolbarComponent(props: App): JSX.Element {
   };
 
   return (
-    <HStack spacing={2}>
+    <HStack spacing={2} width="100%">
       {clientIsElectron ? (
         <>
           {/* Navigation Controls - Only in Electron */}
@@ -779,29 +743,23 @@ function ToolbarComponent(props: App): JSX.Element {
             </Button>
           </Tooltip>
 
-
-
-
-
           {/* Privacy Controls */}
-          {clientIsElectron && (
-            <Tooltip 
-              label={s.privacy.maskPasswords ? "Password masking enabled" : "Password masking disabled"} 
-              placement="top" 
-              hasArrow 
-              openDelay={400}
+          <Tooltip 
+            label={s.privacy.maskPasswords ? "Password masking enabled" : "Password masking disabled"} 
+            placement="top" 
+            hasArrow 
+            openDelay={400}
+          >
+            <Button 
+              onClick={togglePasswordMasking} 
+              size="xs" 
+              px={2}
+              variant={s.privacy.maskPasswords ? "solid" : "outline"}
+              colorScheme={s.privacy.maskPasswords ? "green" : "gray"}
             >
-              <Button 
-                onClick={togglePasswordMasking} 
-                size="xs" 
-                px={2}
-                variant={s.privacy.maskPasswords ? "solid" : "outline"}
-                colorScheme={s.privacy.maskPasswords ? "green" : "gray"}
-              >
-                <MdSecurity size="16px" />
-              </Button>
-            </Tooltip>
-          )}
+              <MdSecurity size="16px" />
+            </Button>
+          </Tooltip>
 
           {/* Zoom Controls */}
           <ButtonGroup isAttached size="xs" colorScheme="teal">
@@ -832,6 +790,59 @@ function ToolbarComponent(props: App): JSX.Element {
               </Button>
             </Tooltip>
           </ButtonGroup>
+
+          {/* Status Information */}
+          <HStack spacing={2} ml="auto">
+            {/* Connection Status Indicator */}
+            <HStack spacing={1}>
+              {recordingError ? (
+                <Tooltip label={`Error: ${recordingError}`} placement="top" hasArrow>
+                  <HStack>
+                    <MdSync color="red" />
+                    <Text fontSize="xs" color="red.500">Error</Text>
+                  </HStack>
+                </Tooltip>
+              ) : connectionStatus === 'connected' && isRecording ? (
+                <Tooltip label="Sync Active" placement="top" hasArrow>
+                  <HStack>
+                    <MdSync color="green" />
+                    <Text fontSize="xs" color="green.500">Active</Text>
+                  </HStack>
+                </Tooltip>
+              ) : connectionStatus === 'connecting' ? (
+                <Tooltip label="Connecting" placement="top" hasArrow>
+                  <HStack>
+                    <MdSync color="orange" />
+                    <Text fontSize="xs" color="orange.500">Connecting</Text>
+                  </HStack>
+                </Tooltip>
+              ) : connectionStatus === 'disconnected' ? (
+                <Tooltip label="Disconnected" placement="top" hasArrow>
+                  <Text fontSize="xs" color="red.500">Disconnected</Text>
+                </Tooltip>
+              ) : (
+                <Tooltip label="Ready" placement="top" hasArrow>
+                  <Text fontSize="xs" color="gray.500">Ready</Text>
+                </Tooltip>
+              )}
+            </HStack>
+
+            {/* Last Sync Time */}
+            {lastEventTimestamp > 0 && (
+              <Tooltip label="Last synchronization time" placement="top" hasArrow>
+                <Text fontSize="xs" color="gray.500">
+                  {new Date(lastEventTimestamp).toLocaleTimeString()}
+                </Text>
+              </Tooltip>
+            )}
+
+            {/* Zoom Level */}
+            <Tooltip label="Current zoom level" placement="top" hasArrow>
+              <Text fontSize="xs" color="gray.500">
+                {Math.round(zoom * 100)}%
+              </Text>
+            </Tooltip>
+          </HStack>
         </>
       ) : (
         <>
