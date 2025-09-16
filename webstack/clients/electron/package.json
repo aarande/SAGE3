@@ -35,7 +35,8 @@
     "local": "electron electron.js -s http://localhost:4200/",
     "build_mac": "build_mac",
     "build_win": "build_win.bat",
-    "build_lnx": "build_lnx"
+    "build_lnx": "build_lnx",
+    "build:portable": "electron-packager . SAGE3 --overwrite --platform=win32 --arch=x64 --out=release-builds --prune=true --icon=assets/icon.ico"
   },
   "author": "Luc Renambot <renambot@gmail.com>",
   "license": "SEE LICENSE IN LICENSE.txt"
