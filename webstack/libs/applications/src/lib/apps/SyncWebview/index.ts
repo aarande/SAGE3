@@ -71,6 +71,6 @@ export const init: Partial<state> = {
 
 export const name = 'SyncWebview';
 
-// Export services for external use
-export * from './services';
+// Note: Do NOT export browser/services here to keep server builds JSX-free.
+// Only export pure TS types from this top-level barrel.
 export * from './types';
